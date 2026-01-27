@@ -6,9 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BASE="$(cd "${CODE}/.." && pwd)"
 
-OUT_BASE="${BASE}/outputs-fnoevio"
+OUT_BASE="${BASE}/outputs"
 if [ ! -d "${OUT_BASE}" ]; then
-    OUT_BASE="${CODE}/outputs-fnoevio"
+    OUT_BASE="${CODE}/outputs"
 fi
 LOG_BASE="${OUT_BASE}/logs"
 
