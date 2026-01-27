@@ -1,0 +1,76 @@
+value0:
+  camera:
+    width: 1280
+    height: 720
+    camera_type: kb4
+    fx: 1049.5830934616608
+    fy: 1049.4229746040553
+    cx: 634.7184038833433
+    cy: 263.46974530961836
+    k1: -0.11519655713574485
+    k2: -0.06222183183004903
+    k3: 0.21682612342850954
+    k4: -0.23528623774744806
+
+  T_imu_cam:
+    px: -0.034803406191293906
+    py: 0.05971773350374604
+    pz: -0.03694727254557562
+    qx: -0.7015384510188221
+    qy: 0.7125976574153885
+    qz: 0.006516107167940321
+    qw: 0.002433256169906342
+
+  T_imu_marker:
+    px: 0.0682395566125301
+    py: 0.05484102693333699
+    pz: 0.06451606289598333
+    qx: 0.4825868335932214
+    qy: 0.3181655742164699
+    qz: 0.6725370155372069
+    qw: 0.4621412967462215
+
+  T_mocap_world:
+    px: -0.3121806772605164
+    py: -1.4511444463653208
+    pz: 0.5170799792233164
+    qx: -0.0004874647434636352
+    qy: -0.6654403327823997
+    qz: -0.7464387321835938
+    qw: 0.004259692561955581
+
+  mocap_time_offset_ns: -4328313
+  mocap_to_imu_offset_ns: -665127304229
+  events_time_offset_ns: 5104563
+
+  auto_align_enable: true
+  auto_align_threshold_sec: 0.5
+  imu_acc_unit: mps2
+  imu_gyro_unit: rad
+  imu_time_unit: us
+  mocap_time_unit: us
+
+  # ===== IMU Calibration Parameters (from TUM-IVE official) =====
+  # Single IMU - use first 3 values as bias mean
+  calib_accel_bias_mean: [0.45966517856562317, 0.6516648969383669, -1.0085952442800643]
+  calib_gyro_bias_mean: [-0.035640270704318286, -0.004618394884393993, -0.011461678383822827]
+
+  # IMU Noise Model
+  accel_noise_std: [0.0012, 0.0012, 0.0012]
+  gyro_noise_std: [8.4503e-05, 8.4503e-05, 8.4503e-05]
+  accel_bias_std: [2.2856e-05, 2.2856e-05, 2.2856e-05]
+  gyro_bias_std: [1.1961e-06, 1.1961e-06, 1.1961e-06]
+
+  # IMU sampling rate (Hz)
+  imu_update_rate: 200.8374923430704
+
+  # Camera time offset
+  cam_time_offset_ns: 5104563
+
+  multi_root: 
+    - ../dataset/TUM-VIE/loop-floor0
+    - ../dataset/TUM-VIE/loop-floor2
+    - ../dataset/TUM-VIE/mocap-desk
+
+  imu_path: imu_data.txt
+  mocap_path: mocap_data.txt

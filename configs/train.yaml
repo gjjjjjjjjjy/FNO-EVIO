@@ -1,0 +1,25 @@
+seed: 0
+device: cuda
+
+dataset:
+  root: /path/to/dataset_root
+  dt: 0.2
+  resolution: [320, 320]
+  sample_stride: 8
+  windowing_mode: imu
+  train_split: 0.9
+
+model:
+  modes: 10
+  stem_channels: 64
+  imu_embed_dim: 64
+  lstm_hidden: 128
+  lstm_layers: 2
+  sequence_length: 50
+
+training:
+  epochs: 10
+  batch_size: 2
+  lr: 0.001
+  eval_interval: 1
+  rpe_dt: 0.5
