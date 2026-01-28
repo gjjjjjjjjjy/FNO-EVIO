@@ -110,6 +110,16 @@ def _clip_gradients(model: nn.Module, max_norm: float) -> None:
         pass
 
 
+def _detach_tree(v: Any) -> Any:
+    if isinstance(v, torch.Tensor):
+        return v.detach()
+    if isinstance(v, (tuple, list)):
+        return type(v)(_detach_tree(x) for x in v)
+    if isinstance(v, dict):
+        return {k: _detach_tree(val) for k, val in v.items()}
+    return v
+
+
 def train(
     *,
     model: nn.Module,
@@ -118,6 +128,7 @@ def train(
     cfg: TrainingConfig,
     device: torch.device,
     dt_window_fallback: float,
+    output_dir: Optional[str] = None,
 ) -> None:
     """
     Train the model for `cfg.epochs` epochs.
@@ -145,11 +156,53 @@ def train(
         tbptt_stride = tbptt_len
     grad_clip = float(getattr(cfg, "grad_clip_norm", NumericalConstants.GRADIENT_CLIP_NORM))
 
+    out_dir = None
+    if output_dir is not None and str(output_dir).strip():
+        out_dir = Path(str(output_dir)).expanduser().resolve()
+        os.makedirs(str(out_dir), exist_ok=True)
+
+    checkpoint_saving_enabled = True
+    best_ckpt_path = (out_dir / "hybrid_vio_best.pth") if out_dir is not None else None
+    last_ckpt_path = (out_dir / "hybrid_vio_last.pth") if out_dir is not None else None
+    best_ckpt_saved = False
+
+    def _try_save_checkpoint(tag: str, payload: Any, dst: Optional[Path]) -> bool:
+        nonlocal checkpoint_saving_enabled
+        if dst is None or not checkpoint_saving_enabled:
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_suffix(dst.suffix + f".tmp.{os.getpid()}")
+        try:
+            try:
+                torch.save(payload, str(tmp), _use_new_zipfile_serialization=False)
+                os.replace(str(tmp), str(dst))
+                print(f"[CKPT {tag}] saved to {dst}")
+                return True
+            except OSError as e:
+                err_no = getattr(e, "errno", None)
+                if err_no in (28, 122):
+                    try:
+                        torch.save(payload, str(dst), _use_new_zipfile_serialization=False)
+                        print(f"[CKPT {tag}] saved to {dst} (non-atomic fallback)")
+                        return True
+                    except Exception:
+                        checkpoint_saving_enabled = False
+                raise
+        except Exception as e:
+            print(f"[CKPT {tag}] save failed: {e}")
+            return False
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+    best_metric = float("inf")
+    bad_epochs = 0
+    metric_hist: List[float] = []
+
     for epoch in range(int(cfg.epochs)):
-        if epoch == 0:
-            best_metric = float("inf")
-            bad_epochs = 0
-            metric_hist: List[float] = []
         total = 0.0
         count = 0
         hidden: Any = None
@@ -258,11 +311,7 @@ def train(
                     _clip_gradients(model, max_norm=grad_clip)
                     optimizer.step()
 
-                try:
-                    if hasattr(hidden, "detach"):
-                        hidden = hidden.detach()
-                except Exception:
-                    pass
+                hidden = _detach_tree(hidden)
 
                 step_idx += tbptt_stride
 
@@ -289,6 +338,7 @@ def train(
                             rpe_dt=float(cfg.rpe_dt),
                             dt=float(dt_window_fallback),
                             eval_sim3_mode=str(cfg.eval_sim3_mode),
+                            speed_thresh=float(getattr(cfg, "speed_thresh", 0.0)),
                         )
                         ates.append(float(ate_i))
                         rpes_t.append(float(rpe_t_i))
@@ -305,6 +355,7 @@ def train(
                         rpe_dt=float(cfg.rpe_dt),
                         dt=float(dt_window_fallback),
                         eval_sim3_mode=str(cfg.eval_sim3_mode),
+                        speed_thresh=float(getattr(cfg, "speed_thresh", 0.0)),
                     )
             except Exception:
                 eval_ate = None
@@ -313,6 +364,7 @@ def train(
             finally:
                 model.train()
 
+        actual_model = model.orig_mod if hasattr(model, "orig_mod") else model
         metrics_csv_path = str(getattr(cfg, "metrics_csv", "") or "").strip()
         if metrics_csv_path and eval_ate is not None:
             p = Path(metrics_csv_path).expanduser().resolve()
@@ -347,17 +399,56 @@ def train(
         metric_hist.append(metric_val)
         ma_w = max(int(getattr(cfg, "earlystop_ma_window", 1)), 1)
         ma_val = float(sum(metric_hist[-ma_w:]) / float(min(len(metric_hist), ma_w)))
+        improved = False
         if epoch + 1 >= int(getattr(cfg, "earlystop_min_epoch", 0)):
             if ma_val + 1e-12 < best_metric:
                 best_metric = ma_val
                 bad_epochs = 0
+                improved = True
             else:
                 bad_epochs += 1
+            if improved and best_ckpt_path is not None:
+                payload = {
+                    "epoch": int(epoch + 1),
+                    "metric": float(ma_val),
+                    "eval_ate": float(eval_ate) if eval_ate is not None else None,
+                    "eval_rpe_t": float(eval_rpe_t) if eval_rpe_t is not None else None,
+                    "eval_rpe_r": float(eval_rpe_r) if eval_rpe_r is not None else None,
+                    "state_dict": actual_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict() if hasattr(scheduler, "state_dict") else None,
+                }
+                best_ckpt_saved = _try_save_checkpoint("best", payload, best_ckpt_path) or best_ckpt_saved
+
             if bad_epochs >= int(getattr(cfg, "patience", 10)):
                 print(f"[EARLYSTOP] epoch={epoch} best_ma={best_metric:.6f} current_ma={ma_val:.6f}")
                 break
+
+        if last_ckpt_path is not None:
+            payload = {
+                "epoch": int(epoch + 1),
+                "metric": float(ma_val),
+                "eval_ate": float(eval_ate) if eval_ate is not None else None,
+                "eval_rpe_t": float(eval_rpe_t) if eval_rpe_t is not None else None,
+                "eval_rpe_r": float(eval_rpe_r) if eval_rpe_r is not None else None,
+                "state_dict": actual_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict() if hasattr(scheduler, "state_dict") else None,
+            }
+            _try_save_checkpoint("last", payload, last_ckpt_path)
 
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(float(eval_ate) if eval_ate is not None else mean_loss)
         else:
             scheduler.step()
+
+    if best_ckpt_saved and best_ckpt_path is not None:
+        try:
+            ckpt_obj = torch.load(str(best_ckpt_path), map_location="cpu")
+            state = ckpt_obj.get("state_dict") if isinstance(ckpt_obj, dict) else ckpt_obj
+            if isinstance(state, dict):
+                actual_model = model.orig_mod if hasattr(model, "orig_mod") else model
+                missing, unexpected = actual_model.load_state_dict(state, strict=False)
+                print(f"[CKPT best] restored | missing={len(missing)} unexpected={len(unexpected)}")
+        except Exception as e:
+            print(f"[CKPT best] restore failed: {e}")

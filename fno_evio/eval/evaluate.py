@@ -65,6 +65,7 @@ def evaluate(
     rpe_dt: float,
     dt: float,
     eval_sim3_mode: str = "diagnose",
+    speed_thresh: float = 0.0,
 ) -> Tuple[float, float, float]:
     """
     Evaluate a VIO model on a sequence loader.
@@ -123,6 +124,7 @@ def evaluate(
         loader=loader,
         device=device,
         dt_fallback=float(dt),
+        speed_thresh=float(speed_thresh),
         base_sample_stride=base_sample_stride,
         contiguous_sid_step=contiguous_sid_step,
         has_window_ts=has_window_ts,
@@ -148,6 +150,7 @@ def align_trajectory_eval(
     loader: DataLoader,
     device: torch.device,
     dt_fallback: float,
+    speed_thresh: float,
     base_sample_stride: int,
     contiguous_sid_step: int,
     has_window_ts: bool,
@@ -328,6 +331,7 @@ def align_trajectory_eval(
                             tdelta_gt=tdelta_gt,
                             s_np=s_np,
                             actual_dt=float(actual_dt),
+                            speed_thresh=float(speed_thresh),
                             eval_v=eval_v,
                             eval_R=eval_R,
                             prev_v_probe=prev_v_probe,
@@ -605,33 +609,55 @@ def _unpack_eval_item(item: Any, *, dt_fallback: float) -> Tuple[torch.Tensor, t
 
 
 def _get_ids(base_seq: Any, base_base: Any, starts_list: Any, s_idx: int, j: int, b: int):
+    ds = base_seq.base if hasattr(base_seq, "base") else base_seq
     try:
-        ds = base_seq.base if hasattr(base_seq, "base") else base_seq
         if starts_list is not None and isinstance(starts_list, (list, tuple)) and b < len(starts_list):
             inner_idx = int(starts_list[b]) + int(j)
         else:
             inner_idx = int(s_idx)
-        contig_id = None
-        if hasattr(ds, "contig_ids"):
+    except Exception:
+        inner_idx = int(s_idx)
+
+    contig_id = None
+    gt_id = None
+
+    try:
+        mapped_idx = inner_idx
+        cur = ds
+        for _ in range(8):
+            if hasattr(cur, "indices") and hasattr(cur, "dataset"):
+                mapped_idx = int(cur.indices[mapped_idx])
+                cur = cur.dataset
+                continue
+            break
+
+        if hasattr(cur, "contig_ids"):
             try:
-                contig_id = int(ds.contig_ids[inner_idx])
+                contig_id = int(cur.contig_ids[mapped_idx])
             except Exception:
                 contig_id = None
-        if hasattr(ds, "sample_indices"):
-            gt_id = int(ds.sample_indices[inner_idx])
         else:
-            gt_id = inner_idx
-    except Exception:
-        contig_id, gt_id = None, None
+            contig_id = int(mapped_idx)
 
-    segment_id = None
-    if hasattr(ds, "segment_ids"):
-        try:
-            if inner_idx >= 0 and inner_idx < len(ds.segment_ids):
-                segment_id = int(ds.segment_ids[inner_idx])
-        except Exception:
-            segment_id = None
-    return contig_id, gt_id, segment_id
+        if hasattr(cur, "sample_indices"):
+            try:
+                gt_id = int(cur.sample_indices[mapped_idx])
+            except Exception:
+                gt_id = int(mapped_idx)
+        else:
+            gt_id = int(mapped_idx)
+
+        segment_id = None
+        if hasattr(cur, "segment_ids"):
+            try:
+                if mapped_idx >= 0 and mapped_idx < len(cur.segment_ids):
+                    segment_id = int(cur.segment_ids[mapped_idx])
+            except Exception:
+                segment_id = None
+
+        return contig_id, gt_id, segment_id
+    except Exception:
+        return None, None, None
 
 
 def _is_contiguous(
@@ -704,11 +730,29 @@ def _quat_to_rot(q: torch.Tensor) -> torch.Tensor:
 def _print_eval_norm_debug(*, model: torch.nn.Module, y: torch.Tensor, actual_dt: float) -> None:
     actual_model = model.orig_mod if hasattr(model, "orig_mod") else model
     dbg = getattr(actual_model, "_last_step_debug", None)
+
     t_hat_body_norm = float(dbg.get("t_hat_body_norm")) if isinstance(dbg, dict) and "t_hat_body_norm" in dbg else float("nan")
     pos_res_norm = float(dbg.get("pos_res_norm")) if isinstance(dbg, dict) and "pos_res_norm" in dbg else float("nan")
     scale_s_val = float(dbg.get("scale_s")) if isinstance(dbg, dict) and "scale_s" in dbg else float("nan")
     if not np.isfinite(scale_s_val) and isinstance(dbg, dict):
         scale_s_val = float(dbg.get("ts")) if "ts" in dbg else float("nan")
+
+    if isinstance(dbg, dict):
+        if not np.isfinite(t_hat_body_norm):
+            t_hat_body_vec = dbg.get("t_hat_body_vec")
+            if isinstance(t_hat_body_vec, np.ndarray) and t_hat_body_vec.ndim == 2 and t_hat_body_vec.shape[1] == 3:
+                t_hat_body_norm = float(np.linalg.norm(t_hat_body_vec, axis=1).mean())
+        if not np.isfinite(pos_res_norm):
+            pos_res_vec = dbg.get("pos_res_vec")
+            if isinstance(pos_res_vec, np.ndarray) and pos_res_vec.ndim == 2 and pos_res_vec.shape[1] == 3:
+                pos_res_norm = float(np.linalg.norm(pos_res_vec, axis=1).mean())
+        if not np.isfinite(scale_s_val):
+            for k in ("scale_s_vec", "ts_vec"):
+                v = dbg.get(k)
+                if isinstance(v, np.ndarray) and v.size > 0:
+                    scale_s_val = float(np.median(v.reshape(-1)))
+                    break
+
     t_delta_gt_norm = float(y[:, 0:3].detach().norm(dim=1).mean().item()) if y.ndim >= 2 and y.shape[1] >= 3 else float("nan")
     print(
         f"[DEBUG NORMS][EVAL] ||t_hat_body||={t_hat_body_norm:.6e} ||pos_res||={pos_res_norm:.6e} "
@@ -744,14 +788,20 @@ def _maybe_print_window_probe(**kwargs) -> None:
     tdelta_gt = kwargs["tdelta_gt"]
     s_np = kwargs["s_np"]
     actual_dt = float(kwargs["actual_dt"])
+    speed_thresh = float(kwargs.get("speed_thresh", 0.0) or 0.0)
     b = int(kwargs["b"])
 
     td_norm = float(np.linalg.norm(td[b]))
     y_norm = float(np.linalg.norm(tdelta_gt[b]))
     ratio_y = td_norm / (y_norm + 1e-12)
 
-    if (s_idx != 0 or j != 0) and not (np.isfinite(ratio_y) and ratio_y > 10.0):
-        return
+    probe_y_min = float(os.getenv("FNO_EVAL_PROBE_YMIN", "1e-3"))
+    moving_y_min = max(probe_y_min, max(speed_thresh, 0.0) * float(actual_dt))
+
+    is_first = s_idx == 0 and j == 0
+    if not is_first:
+        if not (np.isfinite(ratio_y) and ratio_y > 10.0 and y_norm > moving_y_min):
+            return
 
     s_b = float("nan")
     if s_np is not None and getattr(s_np, "size", 0) > b:
@@ -767,15 +817,18 @@ def _lookup_gt(base_ds: Any, sample_ids: np.ndarray, contig_ids: np.ndarray, *, 
     if has_window_ts:
         try:
             wtc = np.asarray(base_ds.window_t_curr, dtype=np.float64)
-            if contig_ids.size > 0 and wtc.size > 0 and int(np.max(contig_ids)) < int(wtc.size):
-                gt_t = wtc[contig_ids]
-                gt_pos_list = []
-                gt_quat_list = []
-                for tt in gt_t.tolist():
-                    p_i, q_i = base_ds.interpolate_gt_data(float(tt))
-                    gt_pos_list.append(p_i.astype(np.float64))
-                    gt_quat_list.append(q_i.astype(np.float64))
-                return np.asarray(gt_pos_list, dtype=np.float64), np.asarray(gt_quat_list, dtype=np.float64), gt_t
+            if contig_ids.size > 0 and wtc.size > 0:
+                contig_ids_i = np.asarray(contig_ids, dtype=np.int64)
+                valid = contig_ids_i >= 0
+                if np.any(valid) and int(np.max(contig_ids_i[valid])) < int(wtc.size):
+                    gt_t = wtc[contig_ids_i]
+                    gt_pos_list = []
+                    gt_quat_list = []
+                    for tt in gt_t.tolist():
+                        p_i, q_i = base_ds.interpolate_gt_data(float(tt))
+                        gt_pos_list.append(p_i.astype(np.float64))
+                        gt_quat_list.append(q_i.astype(np.float64))
+                    return np.asarray(gt_pos_list, dtype=np.float64), np.asarray(gt_quat_list, dtype=np.float64), gt_t
         except Exception:
             pass
     gt_pos = base_ds.gt_pos[sample_ids]

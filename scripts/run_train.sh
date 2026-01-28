@@ -294,6 +294,7 @@ echo ""
 echo "启动训练..."
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} nohup python -u "${CODE}/train_fno_vio.py" \
+    --config "${CODE}/configs/base.yaml" \
     ${DATA_ARGS} \
     ${BASE_ARGS} \
     ${WINDOWING_ARGS} \

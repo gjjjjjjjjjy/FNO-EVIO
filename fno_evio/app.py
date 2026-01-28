@@ -242,13 +242,22 @@ def run_train(
     cfg: TrainingConfig,
     device: torch.device,
     dt: float,
+    output_dir: Optional[str] = None,
 ) -> None:
     """
     Run the training loop.
     """
     from fno_evio.training.loop import train  # local import
 
-    train(model=model, train_loader=train_loader, val_loader=val_loader, cfg=cfg, device=device, dt_window_fallback=float(dt))
+    train(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        cfg=cfg,
+        device=device,
+        dt_window_fallback=float(dt),
+        output_dir=output_dir,
+    )
 
 
 def run_eval(
@@ -269,14 +278,30 @@ def run_eval(
         rpes_t = []
         rpes_r = []
         for ld in val_loader.values():
-            a, t, r = evaluate(model=model, loader=ld, device=device, rpe_dt=float(cfg.rpe_dt), dt=float(dt), eval_sim3_mode=str(cfg.eval_sim3_mode))
+            a, t, r = evaluate(
+                model=model,
+                loader=ld,
+                device=device,
+                rpe_dt=float(cfg.rpe_dt),
+                dt=float(dt),
+                eval_sim3_mode=str(cfg.eval_sim3_mode),
+                speed_thresh=float(getattr(cfg, "speed_thresh", 0.0)),
+            )
             ates.append(float(a))
             rpes_t.append(float(t))
             rpes_r.append(float(r))
         if not ates:
             return (float("nan"), float("nan"), float("nan"))
         return (sum(ates) / float(len(ates)), sum(rpes_t) / float(len(rpes_t)), sum(rpes_r) / float(len(rpes_r)))
-    return evaluate(model=model, loader=val_loader, device=device, rpe_dt=float(cfg.rpe_dt), dt=float(dt), eval_sim3_mode=str(cfg.eval_sim3_mode))
+    return evaluate(
+        model=model,
+        loader=val_loader,
+        device=device,
+        rpe_dt=float(cfg.rpe_dt),
+        dt=float(dt),
+        eval_sim3_mode=str(cfg.eval_sim3_mode),
+        speed_thresh=float(getattr(cfg, "speed_thresh", 0.0)),
+    )
 
 
 def set_global_seed(seed: int) -> None:
@@ -320,7 +345,16 @@ def main(cfg: ExperimentConfig) -> None:
     trainer = build_trainer(cfg.training, model=model, device=device)
     _ = trainer
 
-    run_train(model=model, train_loader=train_loader, val_loader=val_loader, cfg=cfg.training, device=device, dt=float(cfg.dataset.dt))
+    out_dir = str(cfg.output_dir) if cfg.output_dir else "outputs"
+    run_train(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        cfg=cfg.training,
+        device=device,
+        dt=float(cfg.dataset.dt),
+        output_dir=out_dir,
+    )
 
     if int(cfg.training.eval_interval) > 0:
         run_eval(model=model, val_loader=val_loader, cfg=cfg.training, device=device, dt=float(cfg.dataset.dt))
