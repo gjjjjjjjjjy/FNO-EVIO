@@ -20,17 +20,14 @@ try:
 except Exception:
     h5py = None
 
-# 导入训练脚本中的组件
-import sys
 from fno_evio.legacy.train_fno_vio import (
     ModelConfig, HybridVIONet, QuaternionUtils,
     build_device, compute_adaptive_sequence_length, load_calibration,
-    AdaptiveEventProcessor, EventProcessor,
+    AdaptiveEventProcessor,
     SequenceDataset, CollateSequence
 )
 
-# 导入工具函数
-from utils import align_trajectory_with_timestamps, rescale_intrinsics_pinhole
+from fno_evio.legacy.utils import rescale_intrinsics_pinhole
 
 
 def _rotmat_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
@@ -92,28 +89,27 @@ class MVSECDataset(Dataset):
         self.sequence_length = sequence_length
         self.sequence = sequence
 
-        self.H, self.W = resolution
-
-        # 初始化体素化处理器（重用训练脚本中的组件）
         self.adaptive_processor = AdaptiveEventProcessor(
             resolution=resolution,
             device=torch.device('cpu'),
             std_norm=False,
             log_norm=False
         )
-        self.vector_processor = EventProcessor(
-            resolution=resolution,
-            device=torch.device('cpu'),
-            std_norm=False,
-            log_norm=False
-        )
 
-        # 加载数据
         self._load_data()
         self._precompute_indices()
 
+    def _normalize_event_times(self, t_raw: np.ndarray) -> np.ndarray:
+        t = np.asarray(t_raw, dtype=np.float64) * float(getattr(self, "ev_time_scale", 1.0))
+        off_ev_ns = float(self.calib.get("events_time_offset_ns", 0.0)) if isinstance(self.calib, dict) else 0.0
+        if off_ev_ns != 0.0:
+            t = t + off_ev_ns * 1e-9
+        base_off = float(getattr(self, "ev_base_offset_sec", 0.0))
+        if base_off != 0.0:
+            t = t + base_off
+        return t
+
     def _load_data(self):
-        """加载 MVSEC 数据"""
         import h5py
 
         if not self.root.exists():
@@ -163,20 +159,16 @@ class MVSECDataset(Dataset):
             self.data_path = str(data_files[0])
             self.gt_path = str(gt_files[0])
 
-        # 加载 IMU 数据
         with h5py.File(self.data_path, "r") as f:
             left = f["davis"]["left"] if "davis" in f else f
 
-            # 尝试多种 IMU 数据格式
             imu_obj = left["imu"]
             if isinstance(imu_obj, h5py.Group):
-                # 尝试获取 IMU 数据
                 if "data" in imu_obj:
                     imu_ds = imu_obj["data"]
                 elif "values" in imu_obj:
                     imu_ds = imu_obj["values"]
                 elif all(k in imu_obj for k in ["accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"]):
-                    # 如果是分离的加速度计和陀螺仪数据
                     accel = np.stack([
                         imu_obj["accel_x"][:], imu_obj["accel_y"][:], imu_obj["accel_z"][:]
                     ], axis=1)
@@ -188,10 +180,8 @@ class MVSECDataset(Dataset):
                     raise KeyError("IMU group missing expected datasets")
                 imu_ts = (imu_obj["ts"][:] if "ts" in imu_obj else imu_obj["t"][:]).astype(np.float64)
             else:
-                # 处理直接的 HDF5 Dataset（MVSEC 格式）
                 imu_ds = imu_obj
                 if getattr(imu_ds.dtype, "names", None):
-                    # 结构化数组格式
                     arr = imu_ds[:]
                     names = list(imu_ds.dtype.names)
                     ts_field = "ts" if "ts" in names else ("t" if "t" in names else None)
@@ -209,19 +199,15 @@ class MVSECDataset(Dataset):
                         stacked = np.stack([arr[n].astype(np.float32) for n in names], axis=1)
                         imu_data = stacked[:, 1:7] if stacked.shape[1] >= 7 else stacked[:, :6]
                 else:
-                    # 普通数组格式
                     data_arr = imu_ds[:].astype(np.float32)
                     if data_arr.ndim == 2 and data_arr.shape[1] >= 6:
-                        # MVSEC 格式：[accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]
                         imu_data = data_arr[:, :6]
-                        # 尝试获取单独的时间戳
                         if "imu_ts" in left:
                             print(f"[数据集] 找到单独的 IMU 时间戳: {left.name}/imu_ts")
                             imu_ts = left["imu_ts"][:].astype(np.float64)
                         elif "time" in left:
                             imu_ts = left["time"][:].astype(np.float64)
                         else:
-                            # 如果没有单独的时间戳，创建线性时间序列
                             print("[数据集] 警告: 未找到 IMU 时间戳，假设 200Hz 采样率")
                             imu_ts = np.linspace(0.0, float(len(imu_data)) * 0.005, num=len(imu_data))
                     else:
@@ -231,7 +217,6 @@ class MVSECDataset(Dataset):
         self.imu_t = imu_ts.astype(np.float64) * float(self.imu_time_scale)
         self.imu_vals = self._normalize_imu_data(imu_data.astype(np.float32))
 
-        # 加载 GT 数据
         with h5py.File(self.gt_path, "r") as f:
             left = f["davis"]["left"] if "davis" in f else f
 
@@ -243,7 +228,6 @@ class MVSECDataset(Dataset):
                 rotations = pose_matrices[:, :3, :3]
                 self.gt_quat = _rotmat_to_quat_xyzw(rotations).astype(np.float64)
             else:
-                # 尝试其他格式
                 pose = None
                 for k in left.keys():
                     obj = left[k]
@@ -261,7 +245,6 @@ class MVSECDataset(Dataset):
         self.gt_time_scale = self._infer_time_scale(self.gt_t)
         self.gt_t = self.gt_t.astype(np.float64) * float(self.gt_time_scale)
 
-        # 归一化四元数
         self.gt_quat = self.gt_quat / (np.linalg.norm(self.gt_quat, axis=1, keepdims=True) + 1e-12)
 
         self.time_offset_sec = 0.0
@@ -274,16 +257,13 @@ class MVSECDataset(Dataset):
 
         self.ev_base_offset_sec = 0.0
 
-        # 检测事件数据结构
         with h5py.File(self.data_path, "r") as f:
             self._detect_event_structure(f)
 
     def _detect_event_structure(self, f):
-        """检测事件数据结构"""
         parent = None
         t_key = None
 
-        # 遍历查找事件数据
         def visit_fn(name, obj):
             nonlocal parent, t_key
             if isinstance(obj, h5py.Dataset):
@@ -296,12 +276,10 @@ class MVSECDataset(Dataset):
         f.visititems(visit_fn)
 
         if parent is None or t_key is None:
-            # 回退方案：查找其他可能的结构
             if "davis" in f:
                 davis = f["davis"]
                 if "left" in davis:
                     left = davis["left"]
-                    # 查找包含时间戳的数据集
                     for key in left.keys():
                         if "ts" in key or "t" in key or "time" in key:
                             parent = "davis/left"
@@ -311,16 +289,13 @@ class MVSECDataset(Dataset):
         if parent is None or t_key is None:
             raise KeyError("无法找到事件时间戳数据")
 
-        # 对于 MVSEC 数据集，直接使用已知的路径
-        # 事件数据存储在 davis/left/events，格式为 [x, y, t, polarity]
         if "davis" in f and "left" in f["davis"] and "events" in f["davis"]["left"]:
             self._ev_parent = "davis/left"
-            self._ev_t_key = "events"  # 事件数据包含所有信息
-            self._ev_x_key = None  # x 在 events 数组的第 0 列
-            self._ev_y_key = None  # y 在 events 数组的第 1 列
-            self._ev_p_key = None  # polarity 在 events 数组的第 3 列
+            self._ev_t_key = "events"
+            self._ev_x_key = None
+            self._ev_y_key = None
+            self._ev_p_key = None
         else:
-            # 回退到原始检测逻辑
             self._ev_parent = parent
             self._ev_t_key = t_key
             self._ev_x_key = "x" if "x" in f[parent] else None
@@ -328,12 +303,9 @@ class MVSECDataset(Dataset):
             self._ev_p_key = "p" if "p" in f[parent] else ("polarity" if "polarity" in f[parent] else None)
 
     def _normalize_imu_data(self, imu_vals: np.ndarray) -> np.ndarray:
-        """归一化 IMU 数据（与训练脚本相同）"""
-        # 加速度计除以 9.81，陀螺仪除以 π
         accel = imu_vals[:, 0:3] / 9.81
         gyro = imu_vals[:, 3:6] / np.pi
 
-        # 组合并限制范围
         normalized = np.concatenate([accel, gyro], axis=1)
         return np.clip(normalized, -10.0, 10.0).astype(np.float32)
 
@@ -353,18 +325,9 @@ class MVSECDataset(Dataset):
         return 1.0
 
     def _precompute_indices(self):
-        """
-        预计算样本索引，使用 IMU 时间戳作为切窗基准（0-shot 协议）。
-
-        Protocol: 0-shot / online VIO compatible
-        - 窗口边界: 由 IMU 时间戳定义（可观测传感器数据）
-        - GT 位姿: 仅用于计算监督标签，不用于定义窗口
-        """
-        # 使用 IMU 时间戳作为主要时间参考（部署时可观测）
         imu_t = self.imu_t
         dt_window = float(self.dt)
 
-        # 基于 IMU 时间轴生成固定 dt 间隔的窗口
         t_start = float(imu_t[0])
         t_end = float(imu_t[-1])
 
@@ -390,20 +353,16 @@ class MVSECDataset(Dataset):
         t_prev_all = np.array(window_times_prev, dtype=np.float64)
         t_curr_all = np.array(window_times_curr, dtype=np.float64)
 
-        # 存储窗口时间戳（基于 IMU，非 GT）
         self.window_t_prev = t_prev_all
         self.window_t_curr = t_curr_all
 
-        # 查找对应的 GT 索引用于监督（最近邻查找）
         gt_t = self.gt_t.astype(np.float64)
         prev_gt_indices = np.searchsorted(gt_t, t_prev_all, side='left')
         curr_gt_indices = np.searchsorted(gt_t, t_curr_all, side='left')
 
-        # 限制在有效范围内
         prev_gt_indices = np.clip(prev_gt_indices, 0, len(gt_t) - 1)
         curr_gt_indices = np.clip(curr_gt_indices, 0, len(gt_t) - 1)
 
-        # 过滤 GT 时间戳与窗口边界偏差过大的窗口
         max_gt_offset = dt_window * 0.5
         prev_offset = np.abs(gt_t[prev_gt_indices] - t_prev_all)
         curr_offset = np.abs(gt_t[curr_gt_indices] - t_curr_all)
@@ -413,7 +372,6 @@ class MVSECDataset(Dataset):
             n_drop = int(np.sum(~valid))
             print(f"[数据集] 因 GT 对齐问题丢弃 {n_drop}/{len(valid)} 个窗口")
 
-        # 应用过滤
         t_prev_all = t_prev_all[valid]
         t_curr_all = t_curr_all[valid]
         prev_gt_indices = prev_gt_indices[valid]
@@ -425,15 +383,12 @@ class MVSECDataset(Dataset):
         self.window_t_prev = t_prev_all
         self.window_t_curr = t_curr_all
 
-        # 关键：IMU 时间轴切窗时 sample_stride=1
-        # 确保评估代码正确处理连续性检测
         self.sample_stride = 1
 
         print(f"[数据集] IMU 时间轴切窗: {len(self.sample_indices)} 个窗口, dt={dt_window:.4f}s, sample_stride=1")
 
-        # 预计算事件索引范围（使用 IMU 定义的时间戳）
         self.ev_time_scale = 1.0
-        self.ev_base_offset_sec = float(getattr(self, "ev_base_offset_sec", 0.0))
+        self.ev_base_offset_sec = 0.0
         try:
             import h5py
             with h5py.File(self.data_path, "r") as f:
@@ -443,23 +398,15 @@ class MVSECDataset(Dataset):
                     ev_t_raw = ds[:, 2].astype(np.float64)
                 else:
                     ev_t_raw = ds[:].astype(np.float64)
-
-                ev_t = ev_t_raw
-
-                if ev_t.size > 1000:
+                if ev_t_raw.size > 1000:
                     denom = (imu_t[-1] - imu_t[0]) + 1e-12
-                    ratio = (ev_t[-1] - ev_t[0]) / denom
+                    ratio = (ev_t_raw[-1] - ev_t_raw[0]) / denom
                     if 0.8e6 < ratio < 1.2e6:
                         self.ev_time_scale = 1e-6
                     elif 0.8e9 < ratio < 1.2e9:
                         self.ev_time_scale = 1e-9
 
-                ev_t = ev_t.astype(np.float64) * float(self.ev_time_scale)
-
-                off_ev_ns = float(self.calib.get("events_time_offset_ns", 0.0)) if isinstance(self.calib, dict) else 0.0
-                if off_ev_ns != 0.0:
-                    ev_t = ev_t + float(off_ev_ns) * 1e-9
-
+                ev_t = self._normalize_event_times(ev_t_raw)
                 time_offset = float(getattr(self, "time_offset_sec", 0.0))
                 if time_offset != 0.0 and ev_t.size > 0 and imu_t.size > 0:
                     ev0 = float(ev_t[0])
@@ -468,16 +415,11 @@ class MVSECDataset(Dataset):
                         self.ev_base_offset_sec = time_offset
                         ev_t = ev_t + time_offset
 
-                if abs(getattr(self, "time_offset_sec", 0.0)) > 0.0:
-                    ev_t = ev_t + float(self.time_offset_sec)
-                self.ev_t = ev_t
-                # 使用 IMU 定义的窗口时间戳
                 self.h5_start_indices = np.searchsorted(ev_t, self.window_t_prev, side="left")
                 self.h5_end_indices = np.searchsorted(ev_t, self.window_t_curr, side="right")
         except Exception:
             self.h5_start_indices = None
             self.h5_end_indices = None
-            self.ev_t = None
             self.ev_time_scale = 1.0
             self.ev_base_offset_sec = 0.0
 
@@ -485,19 +427,15 @@ class MVSECDataset(Dataset):
         return len(self.sample_indices)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """获取单个样本"""
         i_prev, i_curr = self.prev_indices[idx], self.curr_indices[idx]
-        # 使用 IMU 定义的窗口时间戳（0-shot 协议，无 GT 泄漏）
         if hasattr(self, 'window_t_prev') and self.window_t_prev is not None:
             t_prev, t_curr = float(self.window_t_prev[idx]), float(self.window_t_curr[idx])
         else:
             t_prev, t_curr = float(self.gt_t[i_prev]), float(self.gt_t[i_curr])
 
-        # 加载事件数据
         with h5py.File(self.data_path, "r") as f:
             grp = f[self._ev_parent]
 
-            # 获取事件范围
             if hasattr(self, 'h5_start_indices') and self.h5_start_indices is not None:
                 a, b = int(self.h5_start_indices[idx]), int(self.h5_end_indices[idx])
             else:
@@ -507,22 +445,10 @@ class MVSECDataset(Dataset):
                 else:
                     ev_t_raw = grp[self._ev_t_key][:].astype(np.float64)
 
-                ev_t = ev_t_raw.astype(np.float64) * float(getattr(self, "ev_time_scale", 1.0))
-                off_ev_ns = float(self.calib.get("events_time_offset_ns", 0.0)) if isinstance(self.calib, dict) else 0.0
-                if off_ev_ns != 0.0:
-                    ev_t = ev_t + float(off_ev_ns) * 1e-9
-                base_off = float(getattr(self, "ev_base_offset_sec", 0.0))
-                if base_off != 0.0:
-                    ev_t = ev_t + base_off
-
-                time_scale = getattr(self, "ev_time_scale", 1.0)
-                ev_t = ev_t.astype(np.float64) * time_scale
-                if abs(getattr(self, "time_offset_sec", 0.0)) > 0.0:
-                    ev_t = ev_t + float(self.time_offset_sec)
+                ev_t = self._normalize_event_times(ev_t_raw)
                 a = np.searchsorted(ev_t, t_prev, side="left")
                 b = np.searchsorted(ev_t, t_curr, side="right")
 
-            # 读取事件数据
             if self._ev_x_key is None and self._ev_y_key is None:
                 events_data = grp[self._ev_t_key][a:b]
                 xw = events_data[:, 0].astype(np.float32)
@@ -534,20 +460,10 @@ class MVSECDataset(Dataset):
                 yw = grp[self._ev_y_key][a:b].astype(np.float32)
                 tw = grp[self._ev_t_key][a:b].astype(np.float64)
                 pw = grp[self._ev_p_key][a:b].astype(np.int64) if self._ev_p_key else None
-
-            time_scale = float(getattr(self, "ev_time_scale", 1.0))
-            tw = tw.astype(np.float64) * time_scale
-            off_ev_ns = float(self.calib.get("events_time_offset_ns", 0.0)) if isinstance(self.calib, dict) else 0.0
-            if off_ev_ns != 0.0:
-                tw = tw + float(off_ev_ns) * 1e-9
-            base_off = float(getattr(self, "ev_base_offset_sec", 0.0))
-            if base_off != 0.0:
-                tw = tw + base_off
+            tw = self._normalize_event_times(tw)
             if pw is not None and pw.min() >= 0:
-                # 将 0/1 极性转换为 -1/1
                 pw = np.where(pw == 0, -1, 1).astype(np.int64)
 
-        # 处理 IMU 数据
         imu_mask = (self.imu_t >= t_prev) & (self.imu_t <= t_curr)
         imu_seg = self.imu_vals[imu_mask]
 
@@ -571,22 +487,18 @@ class MVSECDataset(Dataset):
                     pad = self.sequence_length - imu_feat.shape[0]
                     imu_feat = F.pad(imu_feat, (0, 0, 0, pad))
 
-        # 计算相对位姿
         t_prev_pos, t_curr_pos = self.gt_pos[i_prev], self.gt_pos[i_curr]
         q_prev, q_curr = self.gt_quat[i_prev], self.gt_quat[i_curr]
 
         q_delta = QuaternionUtils.multiply(QuaternionUtils.inverse(q_prev), q_curr)
         t_delta = QuaternionUtils.to_rotation_matrix(q_prev).T @ (t_curr_pos - t_prev_pos)
 
-        # 组合目标向量 y：仅作为与训练数据管线的接口占位，不参与 MVSEC ATE/RPE 尺度诊断
-        v_prev = (t_curr_pos - t_prev_pos) / max(t_curr - t_prev, 1e-6)  # world frame 简单速度估计
+        v_prev = (t_curr_pos - t_prev_pos) / max(t_curr - t_prev, 1e-6)
         y = np.concatenate([t_delta, q_delta, q_prev, v_prev], axis=0)
 
-        # 体素化（使用训练脚本中的处理器）
         src_h, src_w = self.sensor_resolution or self.resolution
         dt_win = max(t_curr - t_prev, 1e-6)
 
-        # 使用自适应体素化
         vox = self.adaptive_processor.voxelize_events_adaptive(
             xw, yw, tw, pw, src_w, src_h, t_prev, t_curr
         ).squeeze(0)
@@ -595,13 +507,11 @@ class MVSECDataset(Dataset):
 
 
 def main():
-    """主函数"""
     parser = argparse.ArgumentParser(
         description="测试 FNO-FAST VIO 模型在 MVSEC 数据集上的性能",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # 参数定义
     parser.add_argument("--dataset_root", type=str,
                        default="/Users/gjy/eventlearning/code/dataset/MVSEC",
                        help="MVSEC 数据集根目录路径")
@@ -647,20 +557,16 @@ def main():
     if h5py is None:
         raise RuntimeError("Missing dependency: h5py (required for MVSEC evaluation)")
 
-    # 验证参数
     if args.dt <= 0:
         raise ValueError("--dt 必须为正数")
     if args.rpe_dt <= 0:
         raise ValueError("--rpe_dt 必须为正数")
 
-    # 构建设备
     device = build_device() if args.device == "auto" else torch.device(args.device)
     print(f"使用设备: {device}")
 
-    # 设置传感器分辨率
     sensor_res = tuple(args.sensor_resolution)
 
-    # 加载标定
     calib = load_calibration(args.calib_yaml)
     if calib is not None and "K" in calib:
         fx_raw = float(calib["K"].get("fx", 1.0))
@@ -691,7 +597,6 @@ def main():
     else:
         print("[警告] 未找到标定！物理损失将使用 fx=1.0 (无量纲)")
 
-    # 创建数据集
     imu_seq_len = compute_adaptive_sequence_length(args.dt)
 
     dataset = MVSECDataset(
@@ -704,33 +609,25 @@ def main():
         sequence=(args.sequence if args.sequence else None)
     )
 
-    # 创建序列数据集
     seq_dataset = SequenceDataset(dataset, sequence_len=imu_seq_len, stride=args.sequence_stride)
 
-    # 加载检查点
     if not os.path.exists(args.checkpoint):
         raise FileNotFoundError(f"检查点文件未找到: {args.checkpoint}")
 
     ckpt = torch.load(args.checkpoint, map_location=device)
     sd = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
 
-    # LSTM Compatibility Fix for non-CUDA devices (nn.LSTM -> NativeLSTM)
     if device.type != "cuda":
         new_sd = {}
         lstm_converted = False
         for k, v in sd.items():
             if "temporal_lstm" in k and ("weight_" in k or "bias_" in k) and ".cells." not in k:
-                # Handle nn.LSTM keys: weight_ih_l0, bias_hh_l1, etc.
                 try:
-                    # Extract layer index
-                    suffix = k.split("_l")[-1]  # e.g., "0" from "weight_ih_l0"
+                    suffix = k.split("_l")[-1]
                     layer_idx = int(suffix)
-                    
-                    # Construct new key: cells.{layer}.{param}
-                    # param is weight_ih, weight_hh, bias_ih, bias_hh
-                    base_name = k.split("_l")[0].split(".")[-1] # e.g. "weight_ih"
-                    prefix = k.rsplit(".", 1)[0] # e.g. "temporal_lstm"
-                    
+                    base_name = k.split("_l")[0].split(".")[-1]
+                    prefix = k.rsplit(".", 1)[0]
+
                     new_key = f"{prefix}.cells.{layer_idx}.{base_name}"
                     new_sd[new_key] = v
                     lstm_converted = True
@@ -738,12 +635,11 @@ def main():
                     new_sd[k] = v
             else:
                 new_sd[k] = v
-        
+
         if lstm_converted:
             print("[INFO] Applied LSTM weight conversion (nn.LSTM -> NativeLSTM) for non-CUDA device")
             sd = new_sd
 
-    # 从检查点推断模型配置
     k_channels = int(sd["stem.0.weight"].shape[1]) if "stem.0.weight" in sd else 5
     winK = max(k_channels // 5, 1)
 
@@ -770,7 +666,6 @@ def main():
     has_imu_gate = any("imu_gate" in k for k in sd.keys())
     imu_gate_soft = has_imu_gate
 
-    # 创建模型配置
     mlow = 16
     mhigh = 32
     if use_mr:
@@ -808,7 +703,6 @@ def main():
         attn_groups=8
     )
 
-    # 创建并加载模型
     model = HybridVIONet(config=config).to(device).to(memory_format=torch.channels_last)
     msd = model.state_dict()
     mapped = {}
@@ -837,7 +731,6 @@ def main():
         model.imu_gate_soft = False
         print("[信息] Visual-Only Baseline: 强制 imu_gate_soft=False (禁用 IMU 先验门控)")
 
-    # 创建数据加载器
     print(f"[信息] 配置: dt={args.dt}s, 分辨率={args.resolution}, 序列长度={imu_seq_len}")
     val_loader = DataLoader(
         seq_dataset,
@@ -848,7 +741,6 @@ def main():
         collate_fn=CollateSequence(window_stack_k=winK)
     )
 
-    # 运行评估
     print("开始评估...")
     from fno_evio.legacy.train_fno_vio import evaluate
 

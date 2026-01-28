@@ -63,6 +63,7 @@ def _build_optimizer_and_scheduler(
 
     opt_name = str(getattr(cfg, "optimizer", "adamw")).strip().lower()
     params = list(model.parameters())
+    has_complex_params = any(p.is_complex() for p in params)
     betas = tuple(getattr(cfg, "adam_betas", (0.9, 0.999)))
     eps = float(getattr(cfg, "adam_eps", 1e-8))
     weight_decay = float(getattr(cfg, "weight_decay", 0.01))
@@ -97,7 +98,7 @@ def _build_optimizer_and_scheduler(
         scheduler = main_scheduler
 
     scaler: Optional[torch.cuda.amp.GradScaler] = None
-    if bool(cfg.mixed_precision) and device.type == "cuda":
+    if bool(cfg.mixed_precision) and device.type == "cuda" and not has_complex_params:
         scaler = torch.cuda.amp.GradScaler()
     return model, opt, scheduler, adaptive_loss_fn, scaler
 

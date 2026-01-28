@@ -1,0 +1,21 @@
+value0:
+  camera:
+    width: 346
+    height: 260
+    fx: 1.0
+    fy: 1.0
+    cx: 173.0
+    cy: 130.0
+
+  events_txt_path: events.txt
+  imu_path: imu.txt
+  gt_path: stamped_groundtruth_us.txt
+
+  imu_time_unit: s
+  gt_time_unit: us
+  events_time_unit: s
+
+  events_time_offset_ns: 0
+
+  event_rectify_enable: true
+  event_rectify_map_h5: rectify_map.h5

@@ -18,7 +18,7 @@ from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 
 from fno_evio.common.constants import compute_adaptive_sequence_length
 from fno_evio.config.schema import DatasetConfig, ExperimentConfig, ModelConfig, TrainingConfig
-from fno_evio.data.datasets import OptimizedTUMDataset
+from fno_evio.data.datasets import Davis240Dataset, OptimizedTUMDataset, UZHFPVDataset
 from fno_evio.data.sequence import CollateSequence, SequenceDataset
 
 
@@ -54,38 +54,49 @@ def build_dataloaders(
     mode = str(getattr(cfg, "windowing_mode", "imu")).strip().lower()
     safe_gap = 2 if mode == "imu" else max(int(cfg.sample_stride), 1) * 2
 
+    kind = str(getattr(cfg, "dataset_kind", "tum")).strip().lower()
+    if kind in ("davis240", "davis240c", "davis"):
+        ds_cls = Davis240Dataset
+    elif kind in ("uzhfpv", "uzh-fpv", "fpv"):
+        ds_cls = UZHFPVDataset
+    else:
+        ds_cls = OptimizedTUMDataset
+
     seq_train_list = []
     for r in roots:
-        ds_tr = OptimizedTUMDataset(
-            root=str(r),
-            events_h5=cfg.events_h5,
-            dt=float(cfg.dt),
-            resolution=tuple(cfg.resolution),
-            sensor_resolution=cfg.sensor_resolution,
-            sample_stride=int(cfg.sample_stride),
-            windowing_mode=str(cfg.windowing_mode),
-            window_dt=cfg.window_dt,
-            event_offset_scan=bool(cfg.event_offset_scan),
-            event_offset_scan_range_s=float(cfg.event_offset_scan_range_s),
-            event_offset_scan_step_s=float(cfg.event_offset_scan_step_s),
-            voxelize_in_dataset=bool(cfg.voxelize_in_dataset),
-            derotate=bool(cfg.derotate),
-            calib=_calib_for_root(str(r)),
-            event_file_candidates=tuple(cfg.event_file_candidates),
-            proc_device=(torch.device("cpu") if int(training.num_workers) > 0 else device),
-            std_norm=bool(cfg.voxel_std_norm),
-            log_norm=True,
-            augment=bool(cfg.augment),
-            adaptive_voxel=bool(cfg.adaptive_voxel),
-            event_noise_scale=float(cfg.event_noise_scale),
-            event_scale_jitter=float(cfg.event_scale_jitter),
-            imu_bias_scale=float(cfg.imu_bias_scale),
-            imu_mask_prob=float(cfg.imu_mask_prob),
-            adaptive_base_div=int(cfg.adaptive_base_div),
-            adaptive_max_events_div=int(cfg.adaptive_max_events_div),
-            adaptive_density_cap=float(cfg.adaptive_density_cap),
-            sequence_length=int(model.sequence_length),
-        )
+        ds_kwargs: Dict[str, Any] = {
+            "root": str(r),
+            "events_h5": cfg.events_h5,
+            "dt": float(cfg.dt),
+            "resolution": tuple(cfg.resolution),
+            "sensor_resolution": cfg.sensor_resolution,
+            "sample_stride": int(cfg.sample_stride),
+            "windowing_mode": str(cfg.windowing_mode),
+            "window_dt": cfg.window_dt,
+            "event_offset_scan": bool(cfg.event_offset_scan),
+            "event_offset_scan_range_s": float(cfg.event_offset_scan_range_s),
+            "event_offset_scan_step_s": float(cfg.event_offset_scan_step_s),
+            "voxelize_in_dataset": bool(cfg.voxelize_in_dataset),
+            "derotate": bool(cfg.derotate),
+            "calib": _calib_for_root(str(r)),
+            "event_file_candidates": tuple(cfg.event_file_candidates),
+            "proc_device": (torch.device("cpu") if int(training.num_workers) > 0 else device),
+            "std_norm": bool(cfg.voxel_std_norm),
+            "log_norm": True,
+            "augment": bool(cfg.augment),
+            "adaptive_voxel": bool(cfg.adaptive_voxel),
+            "event_noise_scale": float(cfg.event_noise_scale),
+            "event_scale_jitter": float(cfg.event_scale_jitter),
+            "imu_bias_scale": float(cfg.imu_bias_scale),
+            "imu_mask_prob": float(cfg.imu_mask_prob),
+            "adaptive_base_div": int(cfg.adaptive_base_div),
+            "adaptive_max_events_div": int(cfg.adaptive_max_events_div),
+            "adaptive_density_cap": float(cfg.adaptive_density_cap),
+            "sequence_length": int(model.sequence_length),
+        }
+        if ds_cls is Davis240Dataset:
+            ds_kwargs["side"] = "left"
+        ds_tr = ds_cls(**ds_kwargs)
         n_r = len(ds_tr)
         n_train_r = max(int(float(cfg.train_split) * n_r) - int(safe_gap), 1)
         train_subset = torch.utils.data.Subset(ds_tr, list(range(n_train_r)))
@@ -107,36 +118,39 @@ def build_dataloaders(
         loader_kwargs["prefetch_factor"] = int(training.prefetch_factor)
 
     def _build_val_loader_for_root(r: str) -> DataLoader:
-        ds_val = OptimizedTUMDataset(
-            root=str(r),
-            events_h5=cfg.events_h5,
-            dt=float(cfg.dt),
-            resolution=tuple(cfg.resolution),
-            sensor_resolution=cfg.sensor_resolution,
-            sample_stride=int(cfg.sample_stride),
-            windowing_mode=str(cfg.windowing_mode),
-            window_dt=cfg.window_dt,
-            event_offset_scan=bool(cfg.event_offset_scan),
-            event_offset_scan_range_s=float(cfg.event_offset_scan_range_s),
-            event_offset_scan_step_s=float(cfg.event_offset_scan_step_s),
-            voxelize_in_dataset=bool(cfg.voxelize_in_dataset),
-            derotate=bool(cfg.derotate),
-            calib=_calib_for_root(str(r)),
-            event_file_candidates=tuple(cfg.event_file_candidates),
-            proc_device=(torch.device("cpu") if int(training.num_workers) > 0 else device),
-            std_norm=bool(cfg.voxel_std_norm),
-            log_norm=True,
-            augment=False,
-            adaptive_voxel=bool(cfg.adaptive_voxel),
-            event_noise_scale=float(cfg.event_noise_scale),
-            event_scale_jitter=float(cfg.event_scale_jitter),
-            imu_bias_scale=float(cfg.imu_bias_scale),
-            imu_mask_prob=float(cfg.imu_mask_prob),
-            adaptive_base_div=int(cfg.adaptive_base_div),
-            adaptive_max_events_div=int(cfg.adaptive_max_events_div),
-            adaptive_density_cap=float(cfg.adaptive_density_cap),
-            sequence_length=int(model.sequence_length),
-        )
+        ds_kwargs: Dict[str, Any] = {
+            "root": str(r),
+            "events_h5": cfg.events_h5,
+            "dt": float(cfg.dt),
+            "resolution": tuple(cfg.resolution),
+            "sensor_resolution": cfg.sensor_resolution,
+            "sample_stride": int(cfg.sample_stride),
+            "windowing_mode": str(cfg.windowing_mode),
+            "window_dt": cfg.window_dt,
+            "event_offset_scan": bool(cfg.event_offset_scan),
+            "event_offset_scan_range_s": float(cfg.event_offset_scan_range_s),
+            "event_offset_scan_step_s": float(cfg.event_offset_scan_step_s),
+            "voxelize_in_dataset": bool(cfg.voxelize_in_dataset),
+            "derotate": bool(cfg.derotate),
+            "calib": _calib_for_root(str(r)),
+            "event_file_candidates": tuple(cfg.event_file_candidates),
+            "proc_device": (torch.device("cpu") if int(training.num_workers) > 0 else device),
+            "std_norm": bool(cfg.voxel_std_norm),
+            "log_norm": True,
+            "augment": False,
+            "adaptive_voxel": bool(cfg.adaptive_voxel),
+            "event_noise_scale": float(cfg.event_noise_scale),
+            "event_scale_jitter": float(cfg.event_scale_jitter),
+            "imu_bias_scale": float(cfg.imu_bias_scale),
+            "imu_mask_prob": float(cfg.imu_mask_prob),
+            "adaptive_base_div": int(cfg.adaptive_base_div),
+            "adaptive_max_events_div": int(cfg.adaptive_max_events_div),
+            "adaptive_density_cap": float(cfg.adaptive_density_cap),
+            "sequence_length": int(model.sequence_length),
+        }
+        if ds_cls is Davis240Dataset:
+            ds_kwargs["side"] = "left"
+        ds_val = ds_cls(**ds_kwargs)
 
         n = len(ds_val)
         split = max(int(float(cfg.train_split) * n), 1)

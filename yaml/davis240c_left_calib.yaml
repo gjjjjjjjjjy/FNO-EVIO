@@ -1,0 +1,21 @@
+value0:
+  camera:
+    width: 240
+    height: 180
+    fx: 1.0
+    fy: 1.0
+    cx: 120.0
+    cy: 90.0
+
+  imu_path: imu_data.csv
+  gt_path: gt_stamped_left.txt
+  events_h5: evs_left.h5
+
+  imu_time_unit: ns
+  gt_time_unit: us
+  events_time_unit: us
+
+  events_time_offset_ns: 0
+
+  event_rectify_enable: true
+  event_rectify_map_h5: rectify_map_left.h5

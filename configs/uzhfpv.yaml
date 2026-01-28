@@ -1,0 +1,36 @@
+seed: 42
+device: cuda
+dataset:
+  dataset_kind: uzhfpv
+  root: ""
+  dt: 0.02
+  resolution: [260, 346]
+  sensor_resolution: [260, 346]
+  sample_stride: 4
+  windowing_mode: imu
+  window_dt: 0.02
+  train_split: 0.9
+model:
+  window_stack_K: 3
+  voxel_stack_mode: delta
+  scale_min: 0.0
+  scale_max: 1.0
+training:
+  epochs: 50
+  batch_size: 4
+  lr: 0.001
+  eval_interval: 1
+  eval_batch_size: 1
+  tbptt_len: 75
+  num_workers: 0
+  sequence_len: 200
+  sequence_stride: 200
+  persistent_workers: true
+  prefetch_factor: 1
+  mixed_precision: false
+  scheduler: cosine
+  warmup_epochs: 5
+  patience: 10
+  earlystop_metric: ate
+  optimizer: adamw
+  weight_decay: 0.01
