@@ -7,7 +7,7 @@ dataset:
   sample_stride: 4 #采样步长，即每隔多少个时间步采样一个窗口
   windowing_mode: imu #画窗方式
   window_dt: 0.00833 #每个窗口的时间长度
-  train_split: 0.9
+  train_split: 0.7
 model:
   window_stack_K: 3 #窗口栈深度，即每个窗口的时间长度
   voxel_stack_mode: delta

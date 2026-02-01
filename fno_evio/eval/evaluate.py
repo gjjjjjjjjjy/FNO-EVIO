@@ -504,33 +504,119 @@ def compute_eval_metrics(
 
 def plot_eval(*, traj: EvalTrajectory, diag: EvalDiagnostics, state: Dict[str, Any]) -> None:
     """
-    Optional plotting hook.
+    Plot trajectory visualization if output directory is set.
 
-    This is intentionally a no-op by default to keep evaluation behavior unchanged.
+    Set FNO_EVIO_EVAL_OUTDIR environment variable to enable plotting.
     """
-    _ = (traj, diag, state)
+    outdir = os.environ.get("FNO_EVIO_EVAL_OUTDIR", "").strip()
+    if not outdir:
+        return
+
+    try:
+        from fno_evio.utils.plot_trajectory import (
+            plot_trajectory,
+            plot_trajectory_simple,
+            plot_trajectory_3d,
+        )
+
+        os.makedirs(outdir, exist_ok=True)
+
+        # Get ATE for title
+        ate = state.get("ate", float("nan"))
+        ate_sim3 = state.get("ate_sim3", float("nan"))
+        title = f"ATE={ate:.4f}m (SIM3: {ate_sim3:.4f}m)" if np.isfinite(ate_sim3) else f"ATE={ate:.4f}m"
+
+        # Try evo-based plot first, fall back to simple plot
+        try:
+            plot_trajectory(
+                pred_pos=traj.est_pos,
+                pred_quat=traj.est_quat,
+                pred_t=traj.gt_t,
+                gt_pos=traj.gt_pos,
+                gt_quat=traj.gt_quat,
+                gt_t=traj.gt_t,
+                title=title,
+                filename=os.path.join(outdir, "trajectory.png"),
+                align=True,
+                correct_scale=True,
+            )
+        except Exception as e:
+            print(f"[PLOT] evo plot failed ({e}), using simple plot")
+            plot_trajectory_simple(
+                pred_pos=traj.est_pos,
+                gt_pos=traj.gt_pos,
+                title=title,
+                filename=os.path.join(outdir, "trajectory.png"),
+            )
+
+        # Also save 3D plot
+        try:
+            plot_trajectory_3d(
+                pred_pos=traj.est_pos,
+                gt_pos=traj.gt_pos,
+                title=title,
+                filename=os.path.join(outdir, "trajectory_3d.png"),
+            )
+        except Exception as e:
+            print(f"[PLOT] 3D plot failed: {e}")
+
+    except ImportError as e:
+        print(f"[PLOT] Skipping plot - missing dependency: {e}")
 
 
 def save_eval_outputs(*, traj: EvalTrajectory, diag: EvalDiagnostics, state: Dict[str, Any]) -> None:
     """
-    Optional saving hook for evaluation artifacts.
+    Save evaluation artifacts including trajectories in TUM format.
 
-    The baseline evaluation only prints diagnostics. This function stays a no-op unless the
-    environment variable `FNO_EVIO_EVAL_OUTDIR` is set.
+    Set FNO_EVIO_EVAL_OUTDIR environment variable to enable saving.
+    Outputs:
+        - est_pos.npy, gt_pos.npy, gt_t.npy: numpy arrays
+        - metrics.npy: evaluation metrics
+        - pred_traj.tum, gt_traj.tum: TUM format trajectories
     """
     outdir = os.environ.get("FNO_EVIO_EVAL_OUTDIR", "").strip()
     if not outdir:
         return
     os.makedirs(outdir, exist_ok=True)
+
+    # Save numpy arrays
     np.save(os.path.join(outdir, "est_pos.npy"), traj.est_pos)
+    np.save(os.path.join(outdir, "est_quat.npy"), traj.est_quat)
     np.save(os.path.join(outdir, "gt_pos.npy"), traj.gt_pos)
+    np.save(os.path.join(outdir, "gt_quat.npy"), traj.gt_quat)
     np.save(os.path.join(outdir, "gt_t.npy"), traj.gt_t)
+
+    # Save metrics
     meta = {
         "ate": float(state.get("ate", float("nan"))),
         "ate_sim3": float(state.get("ate_sim3", float("nan"))),
+        "rpe_t": float(state.get("rpe_t", float("nan"))),
+        "rpe_r": float(state.get("rpe_r", float("nan"))),
         "rpe_dt": float(state.get("rpe_dt", float("nan"))),
+        "s_sim3": float(state.get("s_sim3", 1.0)),
+        "direct_ratio": float(state.get("direct_ratio", float("nan"))),
+        "path_ratio": float(state.get("path_ratio", float("nan"))),
     }
     np.save(os.path.join(outdir, "metrics.npy"), meta, allow_pickle=True)
+
+    # Save TUM format trajectories
+    try:
+        from fno_evio.utils.plot_trajectory import save_trajectory_tum
+
+        save_trajectory_tum(
+            positions=traj.est_pos,
+            orientations=traj.est_quat,
+            timestamps=traj.gt_t,
+            filename=os.path.join(outdir, "pred_traj.tum"),
+        )
+        save_trajectory_tum(
+            positions=traj.gt_pos,
+            orientations=traj.gt_quat,
+            timestamps=traj.gt_t,
+            filename=os.path.join(outdir, "gt_traj.tum"),
+        )
+    except Exception as e:
+        print(f"[SAVE] Failed to save TUM trajectories: {e}")
 
 
 def log_eval_summary(*, ate: float, rpe_t: float, rpe_r: float, diag: EvalDiagnostics, state: Dict[str, Any]) -> None:

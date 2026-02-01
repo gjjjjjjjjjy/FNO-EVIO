@@ -17,7 +17,6 @@ class DatasetConfig:
     """Dataset-related configuration."""
 
     root: str
-    dataset_kind: str = "tum"
     multi_root: Optional[List[str]] = None
     events_h5: Optional[str] = None
     dt: float = 0.2

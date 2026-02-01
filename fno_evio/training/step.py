@@ -4,6 +4,9 @@ Single-step forward + loss accumulation for FNO-EVIO.
 Author: gjjjjjjjjjy
 Created: 2026-01-27
 Version: 0.1.0
+
+Notes:
+  Fixed to include prev_v/prev_R state management for proper IMU preintegration.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from fno_evio.config.schema import TrainingConfig
 from fno_evio.training.loss_components import LossComposer
@@ -29,6 +33,70 @@ class StepResult:
     lo: torch.Tensor
     pred: torch.Tensor
     hidden: Any
+    new_v: torch.Tensor
+    new_R: torch.Tensor
+
+
+class IMUStateManager:
+    """
+    Manages IMU state (velocity and rotation) across temporal steps.
+
+    This is essential for proper IMU preintegration - the model needs the previous
+    velocity and rotation to correctly integrate IMU measurements.
+    """
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.velocity: Optional[torch.Tensor] = None
+        self.rotation: Optional[torch.Tensor] = None
+
+    def initialize(self, batch_size: int):
+        """Reset states for a new sequence."""
+        self.velocity = None
+        self.rotation = None
+
+    def detach_states(self):
+        """Detach states from computation graph for TBPTT."""
+        if self.velocity is not None:
+            self.velocity = self.velocity.detach()
+        if self.rotation is not None:
+            self.rotation = self.rotation.detach()
+
+    def update_states(self, new_velocity: torch.Tensor, new_rotation: torch.Tensor):
+        """Update states with model outputs."""
+        self.velocity = new_velocity
+        self.rotation = new_rotation
+
+    def reset(self):
+        """Fully reset states."""
+        self.velocity = None
+        self.rotation = None
+
+
+def quat_to_rot(q: torch.Tensor) -> torch.Tensor:
+    """
+    Convert quaternion [x, y, z, w] to rotation matrix.
+
+    Args:
+        q: Quaternion tensor of shape (..., 4)
+
+    Returns:
+        Rotation matrix of shape (..., 3, 3)
+    """
+    eps = 1e-8
+    q = q / (q.norm(dim=-1, keepdim=True) + eps)
+    x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+
+    R = torch.stack([
+        1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy),
+        2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx),
+        2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)
+    ], dim=-1).reshape(q.shape[:-1] + (3, 3))
+    return R
 
 
 def unpack_and_validate_batch(batch: Any) -> Tuple[Any, List]:
@@ -69,6 +137,7 @@ def train_one_step(
     imu: torch.Tensor,
     y: torch.Tensor,
     hidden: Any,
+    imu_state_mgr: IMUStateManager,
     device: torch.device,
     config: TrainingConfig,
     loss_composer: LossComposer,
@@ -90,6 +159,10 @@ def train_one_step(
       - forward pass and output unpack
       - loss component computation
       - total loss composition (strategy loop)
+
+    Args:
+        imu_state_mgr: IMUStateManager instance for tracking velocity/rotation state
+                       across temporal steps. Essential for proper IMU preintegration.
     """
     vox = ev.to(device, non_blocking=True)
     imu_batch = imu.to(device, non_blocking=True)
@@ -100,13 +173,19 @@ def train_one_step(
     if imu_batch.ndim == 2:
         imu_batch = imu_batch.unsqueeze(0)
 
-    out, hidden, new_v, _, raw_6d, s, ba_pred, bg_pred = model(
+    # Pass prev_v and prev_R from IMU state manager to model for proper preintegration
+    out, hidden, new_v, new_R, raw_6d, s, ba_pred, bg_pred = model(
         vox,
         imu_batch,
         hidden,
+        prev_v=imu_state_mgr.velocity,
+        prev_R=imu_state_mgr.rotation,
         dt_window=float(dt_window_fallback),
         debug=(batch_idx == 0 and step_idx == 0),
     )
+
+    # Update IMU state manager with new velocity and rotation
+    imu_state_mgr.update_states(new_v, new_R)
 
     lt, lr, lp, lo = loss_composer.compute_components(
         out,
@@ -153,5 +232,5 @@ def train_one_step(
         dt_window_fallback=float(dt_window_fallback),
     )
 
-    return StepResult(loss=loss, lt=lt, lr=lr, lv=lv, lp=lp, lo=lo, pred=out, hidden=hidden)
+    return StepResult(loss=loss, lt=lt, lr=lr, lv=lv, lp=lp, lo=lo, pred=out, hidden=hidden, new_v=new_v, new_R=new_R)
 

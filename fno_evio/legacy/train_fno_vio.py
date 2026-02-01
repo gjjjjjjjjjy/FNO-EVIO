@@ -21,7 +21,7 @@ try:
 except Exception:
     hdf5plugin = None
 
-from fno_evio.legacy.utils import (
+from utils import (
     QuaternionUtils,
     warp_events_flow_torch,
     warp_events_flow_torch_kb4,

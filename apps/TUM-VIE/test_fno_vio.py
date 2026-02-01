@@ -137,7 +137,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser("FNO-EVIO evaluation (ported from fno-FAST/test_fno_vio.py)")
     p.add_argument("--dataset_root", type=str, default="")
     p.add_argument("--calib_yaml", type=str, default="")
-    p.add_argument("--dataset_kind", type=str, default="")
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--dt", type=float, default=0.00833)
     p.add_argument("--rpe_dt", type=float, default=None)
@@ -203,15 +202,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     model.eval()
 
     results = []
-    dataset_kind = str(getattr(args, "dataset_kind", "") or "").strip().lower()
-    if not dataset_kind and isinstance(calib_obj, dict):
-        dataset_kind = str(calib_obj.get("dataset_kind", "") or "").strip().lower()
-    if not dataset_kind:
-        dataset_kind = "tum"
     for r in roots:
         ds_cfg = DatasetConfig(
             root=str(Path(r).expanduser().resolve()),
-            dataset_kind=str(dataset_kind),
             dt=float(dt),
             resolution=(int(args.resolution[0]), int(args.resolution[1])),
             sample_stride=8,

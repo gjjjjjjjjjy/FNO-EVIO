@@ -25,7 +25,7 @@ from fno_evio.common.constants import NumericalConstants
 from fno_evio.config.schema import TrainingConfig
 from fno_evio.training.loss_components import LossComposer
 from fno_evio.training.physics import PhysicsBrightnessLoss
-from fno_evio.training.step import StepResult, train_one_step, unpack_and_validate_batch, unpack_step_item
+from fno_evio.training.step import IMUStateManager, StepResult, quat_to_rot, train_one_step, unpack_and_validate_batch, unpack_step_item
 from fno_evio.utils.metrics import compute_rpe_loss
 
 
@@ -202,6 +202,9 @@ def train(
     bad_epochs = 0
     metric_hist: List[float] = []
 
+    # IMU state manager for tracking velocity/rotation across temporal steps
+    imu_state_mgr = IMUStateManager(device)
+
     for epoch in range(int(cfg.epochs)):
         total = 0.0
         count = 0
@@ -214,6 +217,24 @@ def train(
             batch_data, _ = unpack_and_validate_batch(batch)
             if not isinstance(batch_data, list):
                 continue
+
+            # Reset IMU state at the beginning of each batch/sequence
+            imu_state_mgr.reset()
+            hidden = None
+
+            # Initialize IMU rotation from first GT quaternion if available
+            if len(batch_data) > 0:
+                try:
+                    ev0, imu0, y0, _ = unpack_step_item(batch_data[0])
+                    y0_dev = y0.to(device, non_blocking=True)
+                    if y0_dev.ndim == 1:
+                        y0_dev = y0_dev.unsqueeze(0)
+                    if y0_dev.shape[-1] >= 7:
+                        q0 = y0_dev[:, 3:7]  # quaternion [x, y, z, w]
+                        imu_state_mgr.rotation = quat_to_rot(q0)
+                except Exception:
+                    pass
+
             step_idx = 0
             while step_idx < len(batch_data):
                 optimizer.zero_grad(set_to_none=True)
@@ -230,6 +251,7 @@ def train(
                             imu=imu,
                             y=y,
                             hidden=hidden,
+                            imu_state_mgr=imu_state_mgr,
                             device=device,
                             config=cfg,
                             loss_composer=loss_composer,
@@ -312,6 +334,7 @@ def train(
                     optimizer.step()
 
                 hidden = _detach_tree(hidden)
+                imu_state_mgr.detach_states()
 
                 step_idx += tbptt_stride
 

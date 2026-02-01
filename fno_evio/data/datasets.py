@@ -24,7 +24,7 @@ from torch.utils.data import Dataset
 
 from fno_evio.data.events import AdaptiveEventProcessor
 from fno_evio.data.preprocess import preprocess_events, preprocess_gt, preprocess_imu
-from fno_evio.utils.camera import kb4_unproject, rescale_intrinsics_kb4, rescale_intrinsics_pinhole
+from fno_evio.utils.camera import kb4_unproject
 from fno_evio.utils.events_warp import warp_events_flow_torch, warp_events_flow_torch_kb4
 from fno_evio.utils.quaternion_np import QuaternionUtils
 
@@ -110,101 +110,6 @@ def _find_first_matching_file(
 
     return _pick_shortest_path(hits)
 
-
-def _load_numeric_table(path: Path) -> np.ndarray:
-    p = Path(path)
-    skip = 1
-    try:
-        with open(str(p), "r", encoding="utf-8") as f:
-            first = ""
-            for _ in range(5):
-                line = f.readline()
-                if not line:
-                    break
-                s = line.strip()
-                if s:
-                    first = s
-                    break
-            if first and (first[0].isdigit() or first[0] in "+-."):
-                skip = 0
-    except Exception:
-        skip = 1
-    if p.suffix.lower() == ".csv":
-        arr = np.genfromtxt(str(p), delimiter=",", dtype=np.float64, skip_header=skip)
-    else:
-        arr = np.loadtxt(str(p), dtype=np.float64, skiprows=skip)
-    arr = np.asarray(arr)
-    if arr.ndim == 1:
-        arr = arr.reshape(1, -1)
-    return arr
-
-
-def _load_rectify_map_from_h5(path: Path, *, key: Optional[str] = None) -> Optional[np.ndarray]:
-    if not path.exists():
-        return None
-    try:
-        with h5py.File(str(path), "r") as f:
-            if key:
-                if key in f and isinstance(f[key], h5py.Dataset):
-                    arr = f[key][:]
-                    return np.asarray(arr)
-                if "/" in key:
-                    g, d = key.split("/", 1)
-                    if g in f and d in f[g] and isinstance(f[g][d], h5py.Dataset):
-                        arr = f[g][d][:]
-                        return np.asarray(arr)
-                return None
-
-            for k in ("rectify_map", "rectify_map_left", "map", "remap", "undistort_map"):
-                if k in f and isinstance(f[k], h5py.Dataset):
-                    arr = f[k][:]
-                    return np.asarray(arr)
-
-            best = None
-            for name, obj in f.items():
-                if isinstance(obj, h5py.Dataset):
-                    if obj.ndim == 3 and int(obj.shape[-1]) == 2:
-                        best = obj[:]
-                        break
-            if best is None:
-                return None
-            return np.asarray(best)
-    except Exception:
-        return None
-
-
-def _rectify_events_xy(
-    x: np.ndarray,
-    y: np.ndarray,
-    *,
-    rectify_map: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    m = np.asarray(rectify_map)
-    if m.ndim != 3 or int(m.shape[2]) != 2:
-        valid = np.zeros((int(x.shape[0]),), dtype=bool)
-        return x, y, valid
-    Hm, Wm = int(m.shape[0]), int(m.shape[1])
-
-    xi = np.asarray(x, dtype=np.int64)
-    yi = np.asarray(y, dtype=np.int64)
-    valid = (xi >= 0) & (xi < Wm) & (yi >= 0) & (yi < Hm)
-    if not np.any(valid):
-        return x[:0], y[:0], valid
-
-    pts = m[yi[valid], xi[valid], :].astype(np.float32)
-    xv = pts[:, 0]
-    yv = pts[:, 1]
-    finite = np.isfinite(xv) & np.isfinite(yv)
-    if not np.any(finite):
-        valid[valid] = False
-        return x[:0], y[:0], valid
-    xv = xv[finite]
-    yv = yv[finite]
-    valid_idx = np.flatnonzero(valid)
-    valid[valid_idx[~finite]] = False
-    return xv, yv, valid
-
-
 @dataclass
 class OptimizedTUMDataset(Dataset):
     """
@@ -284,22 +189,13 @@ class OptimizedTUMDataset(Dataset):
         self.window_t_prev = None
         self.window_t_curr = None
         if self.event_file_candidates is None:
-            self.event_file_candidates = (
-                "events-left.h5",
-                "events_left.h5",
-                "mocap-6dof-events_left.h5",
-                "evs_left.h5",
-                "evs_left.hdf5",
-                "evs.h5",
-                "evs.hdf5",
-            )
+            self.event_file_candidates = ("events-left.h5", "events_left.h5", "mocap-6dof-events_left.h5")
         self.voxelizer = AdaptiveEventProcessor(
             resolution=self.resolution,
             device=self.proc_device or torch.device('cpu'),
             std_norm=self.std_norm,
             log_norm=self.log_norm
         )
-        self._rectify_map = None
         self._preprocess_data()
         self._precompute_indices()
         self.h5 = None
@@ -342,8 +238,8 @@ class OptimizedTUMDataset(Dataset):
                 f"Expected imu_data.txt & mocap_data.txt, or configure calib keys imu_path/gt_path."
             )
 
-        imu_data = _load_numeric_table(Path(str(imu_path)))
-        gt_data = _load_numeric_table(Path(str(gt_path)))
+        imu_data = np.loadtxt(str(imu_path), dtype=np.float64, skiprows=1)
+        gt_data = np.loadtxt(str(gt_path), dtype=np.float64, skiprows=1)
 
         imu_res = preprocess_imu(self, imu_path=Path(str(imu_path)), imu_data=imu_data)
         self.imu_t = imu_res.imu_t
@@ -372,26 +268,6 @@ class OptimizedTUMDataset(Dataset):
 
         if self.h5_path is None:
             raise FileNotFoundError("Events H5 not found. Provide --events_h5 or place file in root/parent.")
-
-        rectify_enable = False
-        rectify_path = None
-        rectify_key = None
-        if isinstance(self.calib, dict):
-            rectify_enable = bool(self.calib.get("event_rectify_enable", False))
-            rectify_path = self.calib.get("event_rectify_map_h5") or self.calib.get("event_rectify_map") or self.calib.get("event_rectify_map_path")
-            rectify_key = self.calib.get("event_rectify_map_key")
-        if rectify_path:
-            p = _resolve_existing_path(rectify_path, bases=search_dirs, must_be_file=True)
-            if p is not None:
-                rm = _load_rectify_map_from_h5(p, key=(str(rectify_key) if rectify_key else None))
-                if rm is not None:
-                    self._rectify_map = rm
-        elif rectify_enable:
-            p = _find_first_matching_file(search_dirs, ("rectify_map*.h5", "rectify_map*.hdf5"), recursive_root=root_p)
-            if p is not None:
-                rm = _load_rectify_map_from_h5(p, key=(str(rectify_key) if rectify_key else None))
-                if rm is not None:
-                    self._rectify_map = rm
 
         ev_res = preprocess_events(
             self,
@@ -1259,21 +1135,6 @@ class OptimizedTUMDataset(Dataset):
         tw = (tw64 - float(t_prev)).astype(np.float32)
         pw = h5[self._p_key][a:b].astype(np.int64) if self._p_key else None
 
-        rectify_map = getattr(self, "_rectify_map", None)
-        if rectify_map is not None and self.camera_type != "kb4" and xw.size > 0:
-            x_new, y_new, valid = _rectify_events_xy(xw, yw, rectify_map=np.asarray(rectify_map))
-            if valid.size > 0 and np.any(valid):
-                tw = tw[valid]
-                if pw is not None:
-                    pw = pw[valid]
-                xw = x_new
-                yw = y_new
-            else:
-                xw = xw[:0]
-                yw = yw[:0]
-                tw = tw[:0]
-                if pw is not None:
-                    pw = pw[:0]
 
         self._validate_events_data(xw, yw, tw, pw)
 
@@ -1442,384 +1303,5 @@ class OptimizedTUMDataset(Dataset):
             if mask_prob > 0.0:
                 keep = (torch.rand(imu_feat_t.size(0), 1, device=imu_feat_t.device) > mask_prob).to(imu_feat_t.dtype)
                 imu_feat_t = imu_feat_t * keep
-        intr = torch.tensor([float(getattr(self, "fx_scaled", 1.0)), float(getattr(self, "fy_scaled", 1.0))], dtype=torch.float32)
-        return vox, imu_feat_t, torch.from_numpy(y.astype(np.float32)), torch.tensor([dt_win], dtype=torch.float32), intr
-
-
-@dataclass
-class Davis240Dataset(OptimizedTUMDataset):
-    side: str = "left"
-
-    def __post_init__(self):
-        if self.event_file_candidates is None:
-            s = str(getattr(self, "side", "left")).strip().lower() or "left"
-            self.event_file_candidates = (
-                f"evs_{s}.h5",
-                f"evs_{s}.hdf5",
-                f"events-{s}.h5",
-                f"events_{s}.h5",
-                "evs.h5",
-                "evs.hdf5",
-                "events-left.h5",
-                "events_left.h5",
-                "mocap-6dof-events_left.h5",
-            )
-        super().__post_init__()
-
-
-@dataclass
-class UZHFPVDataset(OptimizedTUMDataset):
-    events_txt: Optional[str] = None
-
-    def _preprocess_data(self):
-        root_p = Path(self.root)
-        search_dirs = [root_p]
-
-        imu_hint = None
-        gt_hint = None
-        ev_hint = None
-        if isinstance(self.calib, dict):
-            imu_hint = self.calib.get("imu_path") or self.calib.get("imu_file")
-            gt_hint = self.calib.get("gt_path") or self.calib.get("gt_file") or self.calib.get("groundtruth_path") or self.calib.get("groundtruth_file")
-            ev_hint = (
-                self.events_txt
-                or self.calib.get("events_txt")
-                or self.calib.get("events_txt_path")
-                or self.calib.get("events_path")
-                or self.calib.get("event_path")
-            )
-        if ev_hint is None:
-            ev_hint = self.events_txt
-
-        imu_path = _resolve_existing_path(imu_hint, bases=search_dirs, must_be_file=True)
-        gt_path = _resolve_existing_path(gt_hint, bases=search_dirs, must_be_file=True)
-        ev_path = _resolve_existing_path(ev_hint, bases=search_dirs, must_be_file=True)
-
-        if imu_path is None:
-            imu_path = _resolve_existing_path("imu.txt", bases=search_dirs, must_be_file=True) or _resolve_existing_path("imu_data.txt", bases=search_dirs, must_be_file=True)
-        if gt_path is None:
-            gt_path = _resolve_existing_path("stamped_groundtruth_us.txt", bases=search_dirs, must_be_file=True) or _resolve_existing_path(
-                "groundtruth.txt", bases=search_dirs, must_be_file=True
-            )
-        if ev_path is None:
-            ev_path = _resolve_existing_path("events.txt", bases=search_dirs, must_be_file=True)
-
-        if imu_path is None or gt_path is None or ev_path is None:
-            raise FileNotFoundError(f"UZH-FPV files not found under root={str(root_p)} | events={ev_path} imu={imu_path} gt={gt_path}")
-
-        imu_data = _load_numeric_table(Path(str(imu_path)))
-        gt_data = _load_numeric_table(Path(str(gt_path)))
-
-        imu_res = preprocess_imu(self, imu_path=Path(str(imu_path)), imu_data=imu_data)
-        self.imu_t = imu_res.imu_t
-        self.imu_vals = imu_res.imu_vals
-
-        gt_res = preprocess_gt(self, gt_path=Path(str(gt_path)), gt_data=gt_data)
-        self.gt_t = gt_res.gt_t
-        self.gt_pos = gt_res.gt_pos
-        self.gt_quat = gt_res.gt_quat
-
-        ev_tab = _load_numeric_table(Path(str(ev_path)))
-        if ev_tab.shape[1] < 4:
-            raise ValueError(f"events.txt must have >=4 columns (t,x,y,p), got shape={tuple(ev_tab.shape)}")
-
-        t_raw = ev_tab[:, 0].astype(np.float64)
-        x_raw = ev_tab[:, 1].astype(np.float32)
-        y_raw = ev_tab[:, 2].astype(np.float32)
-        p_raw = ev_tab[:, 3].astype(np.int64)
-
-        t0_path = _resolve_existing_path("t0_us.txt", bases=search_dirs, must_be_file=True)
-        if t0_path is not None:
-            try:
-                t0_us = float(Path(str(t0_path)).read_text(encoding="utf-8").strip().split()[0])
-                off_sec = t0_us * 1e-6
-                if np.nanmedian(t_raw) > 1e5 and off_sec > 1e5:
-                    t_raw = t_raw - off_sec
-                if np.nanmedian(self.imu_t) > 1e5 and off_sec > 1e5:
-                    self.imu_t = self.imu_t - off_sec
-                if np.nanmedian(self.gt_t) > 1e5 and off_sec > 1e5:
-                    self.gt_t = self.gt_t - off_sec
-            except Exception:
-                pass
-
-        events_time_unit = None
-        if isinstance(self.calib, dict):
-            events_time_unit = self.calib.get("events_time_unit") or self.calib.get("event_time_unit")
-        t_sec = self._correct_timestamps(t_raw, unit=events_time_unit)
-
-        off_ev_ns = float(self.calib.get("events_time_offset_ns", 0.0)) if isinstance(self.calib, dict) else 0.0
-        if off_ev_ns != 0.0:
-            t_sec = t_sec + off_ev_ns * 1e-9
-
-        if p_raw.size and int(np.min(p_raw)) >= 0:
-            p_raw = np.where(p_raw == 0, -1, 1).astype(np.int64)
-
-        if t_sec.size and not np.all(np.diff(t_sec) >= 0):
-            order = np.argsort(t_sec)
-            t_sec = t_sec[order]
-            x_raw = x_raw[order]
-            y_raw = y_raw[order]
-            p_raw = p_raw[order]
-
-        self.ev_t = t_sec.astype(np.float64)
-        self.ev_x = x_raw.astype(np.float32)
-        self.ev_y = y_raw.astype(np.float32)
-        self.ev_p = p_raw.astype(np.int64)
-        self.unit_scale = 1.0
-        step = max(int(self.ev_t.size // 1000), 1)
-        self.t_coarse = self.ev_t[::step] if self.ev_t.size else np.zeros((0,), dtype=np.float64)
-
-        if self.sensor_resolution is None:
-            src_h = None
-            src_w = None
-            if isinstance(self.calib, dict) and "resolution" in self.calib:
-                try:
-                    w0, h0 = self.calib["resolution"]
-                    src_h = int(h0)
-                    src_w = int(w0)
-                except Exception:
-                    src_h = None
-                    src_w = None
-            if src_h is None or src_w is None:
-                n_probe = min(int(self.ev_x.shape[0]), 200000)
-                if n_probe > 0:
-                    src_w = int(np.max(self.ev_x[:n_probe]) + 1)
-                    src_h = int(np.max(self.ev_y[:n_probe]) + 1)
-            if src_h is None or src_w is None:
-                raise ValueError("Sensor resolution could not be determined; provide sensor_resolution or calib.resolution.")
-            self.sensor_resolution = (int(src_h), int(src_w))
-
-        fx_scaled = 1.0
-        fy_scaled = 1.0
-        cx_scaled = float(self.resolution[1]) * 0.5
-        cy_scaled = float(self.resolution[0]) * 0.5
-        camera_type = "pinhole"
-        kb4_distortion = None
-
-        if isinstance(self.calib, dict):
-            try:
-                K_src = self.calib["K"] if "K" in self.calib else self.calib.get("camera", {})
-                K_raw = {k: float(K_src.get(k, 1.0 if k in ("fx", "fy") else 0.0)) for k in ("fx", "fy", "cx", "cy")}
-                if "resolution" in self.calib:
-                    sensor_w, sensor_h = self.calib["resolution"]
-                    src_h, src_w = int(sensor_h), int(sensor_w)
-                else:
-                    src_h, src_w = self.sensor_resolution
-                net_h, net_w = tuple(self.resolution)
-                cam_type = str(K_src.get("camera_type", "pinhole")).lower()
-                camera_type = cam_type
-                if cam_type == "kb4":
-                    distortion = {
-                        "k1": float(K_src.get("k1", 0.0)),
-                        "k2": float(K_src.get("k2", 0.0)),
-                        "k3": float(K_src.get("k3", 0.0)),
-                        "k4": float(K_src.get("k4", 0.0)),
-                    }
-                    K_scaled, dist_scaled = rescale_intrinsics_kb4(K_raw, distortion, (src_h, src_w), (net_h, net_w))
-                    kb4_distortion = dist_scaled
-                else:
-                    K_scaled, _ = rescale_intrinsics_pinhole(K_raw, (src_h, src_w), (net_h, net_w))
-                fx_scaled = float(K_scaled.get("fx", fx_scaled))
-                fy_scaled = float(K_scaled.get("fy", fy_scaled))
-                cx_scaled = float(K_scaled.get("cx", src_w * 0.5))
-                cy_scaled = float(K_scaled.get("cy", src_h * 0.5))
-            except Exception:
-                pass
-
-        self.fx_scaled = float(fx_scaled)
-        self.fy_scaled = float(fy_scaled)
-        self.cx_scaled = float(cx_scaled)
-        self.cy_scaled = float(cy_scaled)
-        self.camera_type = str(camera_type)
-        self.kb4_distortion = kb4_distortion
-
-        rectify_enable = False
-        rectify_path = None
-        rectify_key = None
-        if isinstance(self.calib, dict):
-            rectify_enable = bool(self.calib.get("event_rectify_enable", False))
-            rectify_path = self.calib.get("event_rectify_map_h5") or self.calib.get("event_rectify_map") or self.calib.get("event_rectify_map_path")
-            rectify_key = self.calib.get("event_rectify_map_key")
-        if rectify_path:
-            p = _resolve_existing_path(rectify_path, bases=search_dirs, must_be_file=True)
-            if p is not None:
-                rm = _load_rectify_map_from_h5(p, key=(str(rectify_key) if rectify_key else None))
-                if rm is not None:
-                    self._rectify_map = rm
-        elif rectify_enable:
-            p = _find_first_matching_file(search_dirs, ("rectify_map*.h5", "rectify_map*.hdf5"), recursive_root=root_p)
-            if p is not None:
-                rm = _load_rectify_map_from_h5(p, key=(str(rectify_key) if rectify_key else None))
-                if rm is not None:
-                    self._rectify_map = rm
-
-        self._validate_data_integrity()
-
-    def _precompute_event_window_indices(self, t_prev_all: np.ndarray, t_curr_all: np.ndarray):
-        t = np.asarray(getattr(self, "ev_t", np.zeros((0,), dtype=np.float64)), dtype=np.float64)
-        n_win = int(t_prev_all.shape[0])
-        if t.size == 0 or n_win <= 0:
-            z = np.zeros((n_win,), dtype=np.int64)
-            return z, z
-        start_idx = np.searchsorted(t, t_prev_all.astype(np.float64), side="left").astype(np.int64)
-        end_idx = np.searchsorted(t, t_curr_all.astype(np.float64), side="right").astype(np.int64)
-        return start_idx, end_idx
-
-    def _get_h5_file(self):
-        return None
-
-    def __getitem__(self, idx: int):
-        i_prev, i_curr = self.prev_indices[idx], self.curr_indices[idx]
-        if getattr(self, "window_t_prev", None) is not None and getattr(self, "window_t_curr", None) is not None:
-            t_prev = float(self.window_t_prev[idx])
-            t_curr = float(self.window_t_curr[idx])
-        else:
-            t_prev, t_curr = self.gt_t[i_prev], self.gt_t[i_curr]
-
-        if self.h5_start_indices is not None and self.h5_end_indices is not None:
-            a, b = int(self.h5_start_indices[idx]), int(self.h5_end_indices[idx])
-        else:
-            t = self.ev_t.astype(np.float64)
-            a = int(np.searchsorted(t, float(t_prev), side="left"))
-            b = int(np.searchsorted(t, float(t_curr), side="right"))
-
-        xw = self.ev_x[a:b].astype(np.float32)
-        yw = self.ev_y[a:b].astype(np.float32)
-        tw64 = self.ev_t[a:b].astype(np.float64)
-        tw = (tw64 - float(t_prev)).astype(np.float32)
-        pw = self.ev_p[a:b].astype(np.int64)
-
-        rectify_map = getattr(self, "_rectify_map", None)
-        if rectify_map is not None and self.camera_type != "kb4" and xw.size > 0:
-            x_new, y_new, valid = _rectify_events_xy(xw, yw, rectify_map=np.asarray(rectify_map))
-            if valid.size > 0 and np.any(valid):
-                tw = tw[valid]
-                pw = pw[valid]
-                xw = x_new
-                yw = y_new
-            else:
-                xw = xw[:0]
-                yw = yw[:0]
-                tw = tw[:0]
-                pw = pw[:0]
-
-        self._validate_events_data(xw, yw, tw, pw)
-
-        if not self.derotate and self.camera_type == "kb4" and self.kb4_distortion is not None and len(xw) > 0:
-            src_h, src_w = self.sensor_resolution or self.resolution
-            fx = float(getattr(self, "fx_scaled", 1.0))
-            fy = float(getattr(self, "fy_scaled", 1.0))
-            cx = float(getattr(self, "cx_scaled", src_w * 0.5))
-            cy = float(getattr(self, "cy_scaled", src_h * 0.5))
-            k1 = self.kb4_distortion.get("k1", 0.0)
-            k2 = self.kb4_distortion.get("k2", 0.0)
-            k3 = self.kb4_distortion.get("k3", 0.0)
-            k4 = self.kb4_distortion.get("k4", 0.0)
-            X, Y, Z = kb4_unproject(xw, yw, fx, fy, cx, cy, k1, k2, k3, k4)
-            Z_safe = np.where(np.abs(Z) > 1e-6, Z, 1e-6)
-            xw = (fx * X / Z_safe + cx).astype(np.float32)
-            yw = (fy * Y / Z_safe + cy).astype(np.float32)
-            xw = np.clip(xw, 0, src_w - 1)
-            yw = np.clip(yw, 0, src_h - 1)
-
-        imu_mask = (self.imu_t >= t_prev) & (self.imu_t <= t_curr)
-        imu_seg = self.imu_vals[imu_mask]
-        if imu_seg.size == 0:
-            imu_feat_t = torch.zeros((self.sequence_length, 6), dtype=torch.float32)
-        else:
-            imu_arr = torch.from_numpy(imu_seg.astype(np.float32))
-            n = int(imu_arr.shape[0])
-            if n == self.sequence_length:
-                imu_feat_t = imu_arr
-            elif n < self.sequence_length:
-                pad = self.sequence_length - n
-                imu_feat_t = F.pad(imu_arr, (0, 0, 0, pad))
-            else:
-                k = max(n // self.sequence_length, 1)
-                pooled = F.avg_pool1d(imu_arr.transpose(0, 1).unsqueeze(0), kernel_size=k, stride=k, ceil_mode=True)
-                imu_feat_t = pooled.squeeze(0).transpose(0, 1)
-                if imu_feat_t.shape[0] > self.sequence_length:
-                    imu_feat_t = imu_feat_t[:self.sequence_length, :]
-                elif imu_feat_t.shape[0] < self.sequence_length:
-                    pad = self.sequence_length - imu_feat_t.shape[0]
-                    imu_feat_t = F.pad(imu_feat_t, (0, 0, 0, pad))
-
-        if self.calib is not None:
-            R_BI = getattr(self, "_R_BI", None)
-            if R_BI is None:
-                try:
-                    if "R_BI" in self.calib:
-                        R_BI_np = np.asarray(self.calib["R_BI"], dtype=np.float32)
-                    else:
-                        R_BI_np = np.eye(3, dtype=np.float32)
-                except Exception:
-                    R_BI_np = np.eye(3, dtype=np.float32)
-                R_BI = torch.from_numpy(R_BI_np)
-                self._R_BI = R_BI
-            R_BI_t = R_BI.to(dtype=imu_feat_t.dtype)
-            imu_feat_t = imu_feat_t.clone()
-            imu_feat_t[:, 0:3] = imu_feat_t[:, 0:3] @ R_BI_t.transpose(0, 1)
-            imu_feat_t[:, 3:6] = imu_feat_t[:, 3:6] @ R_BI_t.transpose(0, 1)
-
-        if self.derotate and self.calib is not None and imu_seg.size > 0:
-            src_h, src_w = self.sensor_resolution or self.resolution
-            K_src = self.calib["K"] if "K" in self.calib else self.calib.get("camera", {})
-            K = {k: float(K_src.get(k, 1.0 if k in ("fx", "fy") else 0.0)) for k in ["fx", "fy", "cx", "cy"]}
-            if "R_IC" in self.calib:
-                R_CI = np.asarray(self.calib["R_IC"], dtype=np.float64)
-            elif "T_imu_cam" in self.calib:
-                T_ic = self.calib["T_imu_cam"]
-                if isinstance(T_ic, dict) and all(k in T_ic for k in ("qx", "qy", "qz", "qw")):
-                    q = np.array([T_ic["qx"], T_ic["qy"], T_ic["qz"], T_ic["qw"]], dtype=np.float64)
-                    R_CI = QuaternionUtils.to_rotation_matrix(q)
-                else:
-                    M = np.asarray(T_ic, dtype=np.float64)
-                    if M.shape == (4, 4):
-                        R_CI = M[:3, :3]
-                    elif M.shape == (3, 3):
-                        R_CI = M
-                    else:
-                        R_CI = np.eye(3)
-            elif "R_imu_cam" in self.calib:
-                R_CI = np.asarray(self.calib["R_imu_cam"], dtype=np.float64)
-            else:
-                R_CI = np.eye(3)
-            omega_cam = R_CI @ np.mean(imu_seg[:, 3:6], axis=0)
-            dev = self.proc_device or torch.device('cpu')
-            xw_t = torch.from_numpy(np.asarray(xw, dtype=np.float32)).to(dev)
-            yw_t = torch.from_numpy(np.asarray(yw, dtype=np.float32)).to(dev)
-            tw_t = torch.from_numpy(np.asarray(tw, dtype=np.float32)).to(dev)
-            omega_t = torch.from_numpy(np.asarray(omega_cam, dtype=np.float32)).to(dev)
-
-            if self.camera_type == "kb4" and self.kb4_distortion is not None:
-                xw_t, yw_t, valid_mask = warp_events_flow_torch_kb4(
-                    xw_t, yw_t, tw_t, omega_t, K, self.kb4_distortion, (src_h, src_w), 0.0
-                )
-                if valid_mask.any():
-                    xw_t = xw_t[valid_mask]
-                    yw_t = yw_t[valid_mask]
-                    tw_t = tw_t[valid_mask]
-                    pw = pw[valid_mask.cpu().numpy()]
-            else:
-                xw_t, yw_t = warp_events_flow_torch(xw_t, yw_t, tw_t, omega_t, K, (src_h, src_w), 0.0)
-
-            xw = xw_t
-            yw = yw_t
-            tw = tw_t
-
-        dt_true = float(t_curr - t_prev)
-        dt_win = max(dt_true, 1e-6)
-        t_prev_pos, q_prev = self.interpolate_gt_data(float(t_prev))
-        t_curr_pos, q_curr = self.interpolate_gt_data(float(t_curr))
-        v_prev = self.interpolate_gt_velocity(float(t_prev), dt=dt_win * 0.5)
-        v_curr = self.interpolate_gt_velocity(float(t_curr), dt=dt_win * 0.5)
-        q_delta = QuaternionUtils.multiply(QuaternionUtils.inverse(q_prev), q_curr)
-        t_delta = QuaternionUtils.to_rotation_matrix(q_prev).T @ (t_curr_pos - t_prev_pos)
-        y = np.concatenate(
-            [t_delta.astype(np.float64), q_delta.astype(np.float64), q_prev.astype(np.float64), v_prev.astype(np.float64), v_curr.astype(np.float64)],
-            axis=0,
-        )
-        src_h, src_w = self.sensor_resolution or self.resolution
-        vox = self.voxelizer.voxelize_events_adaptive(xw, yw, tw, pw, src_w, src_h, 0.0, dt_win)
         intr = torch.tensor([float(getattr(self, "fx_scaled", 1.0)), float(getattr(self, "fy_scaled", 1.0))], dtype=torch.float32)
         return vox, imu_feat_t, torch.from_numpy(y.astype(np.float32)), torch.tensor([dt_win], dtype=torch.float32), intr
