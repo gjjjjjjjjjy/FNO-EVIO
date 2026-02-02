@@ -1144,10 +1144,18 @@ class OptimizedTUMDataset(Dataset):
         # 避免同一批坐标被重复当作 KB4 像素处理
         if not self.derotate and self.camera_type == "kb4" and self.kb4_distortion is not None and len(xw) > 0:
             src_h, src_w = self.sensor_resolution or self.resolution
-            fx = float(getattr(self, "fx_scaled", 1.0))
-            fy = float(getattr(self, "fy_scaled", 1.0))
-            cx = float(getattr(self, "cx_scaled", src_w * 0.5))
-            cy = float(getattr(self, "cy_scaled", src_h * 0.5))
+            use_raw = self.sensor_resolution is not None and tuple(self.sensor_resolution) != tuple(self.resolution)
+            if use_raw and isinstance(self.calib, dict):
+                K_src = self.calib["K"] if "K" in self.calib else self.calib.get("camera", {})
+                fx = float(K_src.get("fx", 1.0))
+                fy = float(K_src.get("fy", 1.0))
+                cx = float(K_src.get("cx", src_w * 0.5))
+                cy = float(K_src.get("cy", src_h * 0.5))
+            else:
+                fx = float(getattr(self, "fx_scaled", 1.0))
+                fy = float(getattr(self, "fy_scaled", 1.0))
+                cx = float(getattr(self, "cx_scaled", src_w * 0.5))
+                cy = float(getattr(self, "cy_scaled", src_h * 0.5))
             k1 = self.kb4_distortion.get("k1", 0.0)
             k2 = self.kb4_distortion.get("k2", 0.0)
             k3 = self.kb4_distortion.get("k3", 0.0)

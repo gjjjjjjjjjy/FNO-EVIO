@@ -66,7 +66,7 @@ def evaluate(
     dt: float,
     eval_sim3_mode: str = "diagnose",
     speed_thresh: float = 0.0,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, Dict[str, Any]]:
     """
     Evaluate a VIO model on a sequence loader.
 
@@ -82,6 +82,7 @@ def evaluate(
         ate: Absolute Trajectory Error (meters), after SE(3) alignment.
         rpe_t: Relative Pose Error in translation (meters).
         rpe_r: Relative Pose Error in rotation (degrees).
+        state: Dictionary containing additional evaluation metrics and diagnostics.
     """
     model.eval()
 
@@ -141,7 +142,7 @@ def evaluate(
     plot_eval(traj=traj, diag=diag, state=log_state)
     save_eval_outputs(traj=traj, diag=diag, state=log_state)
 
-    return ate, rpe_t, rpe_r
+    return ate, rpe_t, rpe_r, log_state
 
 
 def align_trajectory_eval(
@@ -346,7 +347,10 @@ def align_trajectory_eval(
                     est_quat.append(qb.copy())
                     sample_ids.append(int(sid))
                     contig_ids.append(int(contig_id) if contig_id is not None else -1)
-                    seg_keys.append(int(s_idx) * 1_000_000 + int(b))
+                    # Use actual segment_id from dataset instead of s_idx to avoid
+                    # splitting continuous trajectories across SequenceDataset batches
+                    seg_key = int(segment_id) if segment_id is not None else int(s_idx) * 1_000_000 + int(b)
+                    seg_keys.append(seg_key)
                     diag.win_step_pred.append(float(np.linalg.norm(td[b])))
                     diag.win_step_gt.append(float(np.linalg.norm(tdelta_gt[b])))
 
@@ -481,7 +485,7 @@ def compute_eval_metrics(
         ate_sim3 = float(np.sqrt(np.mean(np.asarray(sim3_sq_errors, dtype=np.float64)))) if sim3_sq_errors else float("nan")
         s_sim3 = float(np.mean(np.asarray(sim3_scales, dtype=np.float64))) if sim3_scales else 1.0
 
-        state.update({"ate_sim3": ate_sim3, "s_sim3": s_sim3})
+        state.update({"ate": ate, "ate_sim3": ate_sim3, "s_sim3": s_sim3})
 
         if se3_ate_seq:
             se3_seq_arr = np.asarray(se3_ate_seq, dtype=np.float64)
@@ -497,6 +501,7 @@ def compute_eval_metrics(
         _log_step_diagnostics(traj=traj, diag=diag, state=state)
     else:
         ate = float(np.sqrt(np.mean(np.sum((traj.est_pos[:m] - traj.gt_pos[:m]) ** 2, axis=1))))
+        state["ate"] = ate
 
     rpe_t, rpe_r = _compute_rpe(traj=traj, state=state, rpe_dt=float(rpe_dt))
     return ate, rpe_t, rpe_r, state
@@ -520,6 +525,9 @@ def plot_eval(*, traj: EvalTrajectory, diag: EvalDiagnostics, state: Dict[str, A
         )
 
         os.makedirs(outdir, exist_ok=True)
+
+        # Debug: print trajectory lengths
+        print(f"[PLOT DEBUG] est_pos.shape={traj.est_pos.shape}, gt_pos.shape={traj.gt_pos.shape}")
 
         # Get ATE for title
         ate = state.get("ate", float("nan"))
@@ -711,9 +719,14 @@ def _get_ids(base_seq: Any, base_base: Any, starts_list: Any, s_idx: int, j: int
         mapped_idx = inner_idx
         cur = ds
         for _ in range(8):
+            # Handle Subset (has indices + dataset)
             if hasattr(cur, "indices") and hasattr(cur, "dataset"):
                 mapped_idx = int(cur.indices[mapped_idx])
                 cur = cur.dataset
+                continue
+            # Handle SequenceDataset or other wrappers (has base but no indices)
+            if hasattr(cur, "base") and not hasattr(cur, "segment_ids"):
+                cur = cur.base
                 continue
             break
 

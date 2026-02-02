@@ -198,7 +198,8 @@ def train(
             except Exception:
                 pass
 
-    best_metric = float("inf")
+    best_metric = float("inf")  # For early stopping (uses composite/ma)
+    best_ate = float("inf")  # For best checkpoint saving (pure ATE, like FNO-FAST)
     bad_epochs = 0
     metric_hist: List[float] = []
 
@@ -222,16 +223,24 @@ def train(
             imu_state_mgr.reset()
             hidden = None
 
-            # Initialize IMU rotation from first GT quaternion if available
+            # Initialize IMU rotation from first GT absolute quaternion if available
+            # GT format: [0:3] delta_p, [3:7] delta_q, [7:11] q_prev, [11:14] v_prev, [14:17] v_curr
             if len(batch_data) > 0:
                 try:
                     ev0, imu0, y0, _ = unpack_step_item(batch_data[0])
                     y0_dev = y0.to(device, non_blocking=True)
                     if y0_dev.ndim == 1:
                         y0_dev = y0_dev.unsqueeze(0)
-                    if y0_dev.shape[-1] >= 7:
-                        q0 = y0_dev[:, 3:7]  # quaternion [x, y, z, w]
+                    # Use absolute quaternion at y[:, 7:11] for IMU rotation initialization
+                    # This matches FNO-FAST's behavior (train_fno_vio.py:4703)
+                    if y0_dev.shape[-1] >= 11:
+                        q0 = y0_dev[:, 7:11]  # absolute quaternion [x, y, z, w]
+                        q0 = torch.nn.functional.normalize(q0, p=2, dim=1)
                         imu_state_mgr.rotation = quat_to_rot(q0)
+                    # Also initialize velocity from v_prev if available
+                    if y0_dev.shape[-1] >= 14:
+                        v0 = y0_dev[:, 11:14]  # v_prev
+                        imu_state_mgr.velocity = v0
                 except Exception:
                     pass
 
@@ -345,6 +354,9 @@ def train(
         eval_rpe_t = None
         eval_rpe_r = None
         if val_loader is not None and int(cfg.eval_interval) > 0 and ((epoch + 1) % int(cfg.eval_interval) == 0):
+            # Temporarily disable plotting during regular eval (will plot only for best model)
+            _old_eval_outdir = os.environ.get("FNO_EVIO_EVAL_OUTDIR", "")
+            os.environ["FNO_EVIO_EVAL_OUTDIR"] = ""
             try:
                 from fno_evio.eval.evaluate import evaluate
 
@@ -385,6 +397,7 @@ def train(
                 eval_rpe_t = None
                 eval_rpe_r = None
             finally:
+                os.environ["FNO_EVIO_EVAL_OUTDIR"] = _old_eval_outdir
                 model.train()
 
         actual_model = model.orig_mod if hasattr(model, "orig_mod") else model
@@ -409,32 +422,13 @@ def train(
                 )
                 f.flush()
 
-        metric_mode = str(getattr(cfg, "earlystop_metric", "composite")).strip().lower()
-        alpha = float(getattr(cfg, "earlystop_alpha", 1.0))
-        beta = float(getattr(cfg, "earlystop_beta", 0.2))
-        if metric_mode == "train_loss":
-            metric_val = float(mean_loss)
-        elif metric_mode == "eval_loss":
-            metric_val = float(eval_ate) if eval_ate is not None else float(mean_loss)
-        else:
-            base_val = float(eval_ate) if eval_ate is not None else float(mean_loss)
-            metric_val = alpha * base_val + beta * float(mean_loss)
-        metric_hist.append(metric_val)
-        ma_w = max(int(getattr(cfg, "earlystop_ma_window", 1)), 1)
-        ma_val = float(sum(metric_hist[-ma_w:]) / float(min(len(metric_hist), ma_w)))
-        improved = False
-        if epoch + 1 >= int(getattr(cfg, "earlystop_min_epoch", 0)):
-            if ma_val + 1e-12 < best_metric:
-                best_metric = ma_val
-                bad_epochs = 0
-                improved = True
-            else:
-                bad_epochs += 1
-            if improved and best_ckpt_path is not None:
+        if eval_ate is not None and float(eval_ate) < best_ate:
+            best_ate = float(eval_ate)
+            if best_ckpt_path is not None:
                 payload = {
                     "epoch": int(epoch + 1),
-                    "metric": float(ma_val),
-                    "eval_ate": float(eval_ate) if eval_ate is not None else None,
+                    "metric": float(eval_ate),
+                    "eval_ate": float(eval_ate),
                     "eval_rpe_t": float(eval_rpe_t) if eval_rpe_t is not None else None,
                     "eval_rpe_r": float(eval_rpe_r) if eval_rpe_r is not None else None,
                     "state_dict": actual_model.state_dict(),
@@ -442,6 +436,59 @@ def train(
                     "scheduler": scheduler.state_dict() if hasattr(scheduler, "state_dict") else None,
                 }
                 best_ckpt_saved = _try_save_checkpoint("best", payload, best_ckpt_path) or best_ckpt_saved
+
+                # Generate trajectory plots for best model
+                _eval_outdir = os.environ.get("FNO_EVIO_EVAL_OUTDIR", "").strip()
+                if _eval_outdir and val_loader is not None:
+                    try:
+                        from fno_evio.eval.evaluate import evaluate
+                        model.eval()
+                        _loader = list(val_loader.values())[0] if isinstance(val_loader, dict) else val_loader
+                        _ = evaluate(
+                            model=model,
+                            loader=_loader,
+                            device=device,
+                            rpe_dt=float(cfg.rpe_dt),
+                            dt=float(dt_window_fallback),
+                            eval_sim3_mode=str(cfg.eval_sim3_mode),
+                            speed_thresh=float(getattr(cfg, "speed_thresh", 0.0)),
+                        )
+                        print(f"[PLOT] Best model (ATE={best_ate:.6f}) trajectory saved to {_eval_outdir}")
+                    except Exception as e:
+                        print(f"[PLOT] Failed to generate best model plot: {e}")
+                    finally:
+                        model.train()
+
+        # ========== Early stopping (composite/ma, like FNO-FAST) ==========
+        # This controls when to STOP training, NOT when to save best checkpoint
+        metric_mode = str(getattr(cfg, "earlystop_metric", "composite")).strip().lower()
+        alpha = float(getattr(cfg, "earlystop_alpha", 1.0))
+        beta = float(getattr(cfg, "earlystop_beta", 0.2))
+        if metric_mode == "train_loss":
+            metric_val = float(mean_loss)
+        elif metric_mode in ("eval_loss", "ate"):
+            metric_val = float(eval_ate) if eval_ate is not None else float(mean_loss)
+        elif metric_mode == "composite":
+            # FNO-FAST: ate + alpha * rpe_t + beta * rpe_r
+            if eval_ate is not None:
+                rpe_t_val = float(eval_rpe_t) if eval_rpe_t is not None else 0.0
+                rpe_r_val = float(eval_rpe_r) if eval_rpe_r is not None else 0.0
+                metric_val = float(eval_ate) + alpha * rpe_t_val + beta * rpe_r_val
+            else:
+                metric_val = float(mean_loss)
+        else:
+            metric_val = float(eval_ate) if eval_ate is not None else float(mean_loss)
+
+        metric_hist.append(metric_val)
+        ma_w = max(int(getattr(cfg, "earlystop_ma_window", 1)), 1)
+        ma_val = float(sum(metric_hist[-ma_w:]) / float(min(len(metric_hist), ma_w)))
+
+        if epoch + 1 >= int(getattr(cfg, "earlystop_min_epoch", 0)):
+            if ma_val + 1e-12 < best_metric:
+                best_metric = ma_val
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
 
             if bad_epochs >= int(getattr(cfg, "patience", 10)):
                 print(f"[EARLYSTOP] epoch={epoch} best_ma={best_metric:.6f} current_ma={ma_val:.6f}")

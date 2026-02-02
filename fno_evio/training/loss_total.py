@@ -149,7 +149,10 @@ def _loss_seq_scale_reg(
     s_step = torch.clamp(num / den, min=1e-6, max=1e6)
     loss = loss + w * (torch.log(s_step) ** 2)
     if batch_idx == 0 and step_idx == 0:
-        print(f"[TRAIN SCALE] seq_scale_reg enabled (w={w:.4f}) | s_step_ols={float(s_step.detach().item()):.6f}")
+        n_moving = int(moving.sum().item())
+        pred_norm_mean = float(dp_pred[moving].norm(dim=1).mean().item()) if n_moving > 0 else 0.0
+        gt_norm_mean = float(dp_gt[moving].norm(dim=1).mean().item()) if n_moving > 0 else 0.0
+        print(f"[TRAIN SCALE] seq_scale_reg enabled (w={w:.4f}) | s_step_ols={float(s_step.detach().item()):.6f} | num={float(num.item()):.6e} den={float(den.item()):.6e} | n_moving={n_moving} | ||pred||={pred_norm_mean:.6e} ||gt||={gt_norm_mean:.6e}")
     return loss
 
 

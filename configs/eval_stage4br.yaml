@@ -1,0 +1,41 @@
+seed: 42
+device: cuda
+dataset:
+  root: ""
+  dt: 0.00833
+  resolution: [180, 320]
+  sample_stride: 4
+  windowing_mode: imu
+  window_dt: 0.00833
+  train_split: 0.0  # 全数据集评估
+model:
+  window_stack_K: 3
+  voxel_stack_mode: delta
+  scale_min: 0.0
+  scale_max: 1.0
+  # Stage 4br: Bayesian uncertainty fusion
+  use_uncertainty_fusion: true
+  uncertainty_use_gate: true
+training:
+  epochs: 500
+  batch_size: 512
+  lr: 0.00006
+  eval_interval: 1
+  eval_batch_size: 1
+  tbptt_len: 75
+  num_workers: 2
+  sequence_len: 400
+  sequence_stride: 400
+  persistent_workers: true
+  prefetch_factor: 1
+  mixed_precision: true
+  scheduler: cosine
+  warmup_epochs: 20
+  patience: 50
+  earlystop_metric: ate
+  optimizer: adamw
+  weight_decay: 0.01
+  # Stage 4br specific
+  speed_thresh: 0.05
+  rpe_dt: 0.5
+  eval_sim3_mode: diagnose

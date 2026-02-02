@@ -61,6 +61,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup_epochs", type=int, default=None)
     p.add_argument("--patience", type=int, default=None)
     p.add_argument("--earlystop_metric", type=str, default=None)
+    p.add_argument("--earlystop_min_epoch", type=int, default=None)
+    p.add_argument("--earlystop_ma_window", type=int, default=None)
 
     p.add_argument("--mixed_precision", dest="mixed_precision", action="store_true", default=None)
     p.add_argument("--no-mixed_precision", dest="mixed_precision", action="store_false", default=None)
@@ -148,6 +150,8 @@ def build_cfg_from_args(args: argparse.Namespace) -> ExperimentConfig:
         "warmup_epochs": getattr(args, "warmup_epochs", None),
         "patience": getattr(args, "patience", None),
         "earlystop_metric": getattr(args, "earlystop_metric", None),
+        "earlystop_min_epoch": getattr(args, "earlystop_min_epoch", None),
+        "earlystop_ma_window": getattr(args, "earlystop_ma_window", None),
         "mixed_precision": getattr(args, "mixed_precision", None),
         "adaptive_loss_weights": getattr(args, "adaptive_loss_weights", None),
         "loss_w_t": getattr(args, "loss_w_t", None),

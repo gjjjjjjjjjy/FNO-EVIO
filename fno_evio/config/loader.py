@@ -59,6 +59,18 @@ def load_experiment_config(path: str) -> ExperimentConfig:
     return experiment_config_from_dict(d)
 
 
+def to_legacy_model_config(cfg: ModelConfig) -> Any:
+    """
+    Convert new ModelConfig to legacy ModelConfig for HybridVIONet compatibility.
+
+    This function creates a legacy.train_fno_vio.ModelConfig instance from
+    the new fno_evio.config.schema.ModelConfig. Both have identical fields,
+    so we use asdict() for automatic conversion.
+    """
+    from fno_evio.legacy.train_fno_vio import ModelConfig as LegacyModelConfig
+    return LegacyModelConfig(**asdict(cfg))
+
+
 def merge_cli_overrides(cfg: ExperimentConfig, *, overrides: Dict[str, Any]) -> ExperimentConfig:
     """
     Apply CLI overrides to an ExperimentConfig.

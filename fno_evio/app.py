@@ -18,8 +18,12 @@ from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 
 from fno_evio.common.constants import compute_adaptive_sequence_length
 from fno_evio.config.schema import DatasetConfig, ExperimentConfig, ModelConfig, TrainingConfig
-from fno_evio.data.datasets import Davis240Dataset, OptimizedTUMDataset, UZHFPVDataset
+from fno_evio.data.datasets import OptimizedTUMDataset
 from fno_evio.data.sequence import CollateSequence, SequenceDataset
+
+# Placeholder for future dataset implementations
+# TODO: Implement Davis240Dataset and UZHFPVDataset when needed
+# from fno_evio.data.datasets import Davis240Dataset, UZHFPVDataset
 
 
 def build_dataloaders(
@@ -56,9 +60,9 @@ def build_dataloaders(
 
     kind = str(getattr(cfg, "dataset_kind", "tum")).strip().lower()
     if kind in ("davis240", "davis240c", "davis"):
-        ds_cls = Davis240Dataset
+        raise NotImplementedError(f"Davis240Dataset is not yet implemented. Use dataset_kind='tum' for now.")
     elif kind in ("uzhfpv", "uzh-fpv", "fpv"):
-        ds_cls = UZHFPVDataset
+        raise NotImplementedError(f"UZHFPVDataset is not yet implemented. Use dataset_kind='tum' for now.")
     else:
         ds_cls = OptimizedTUMDataset
 
@@ -94,8 +98,9 @@ def build_dataloaders(
             "adaptive_density_cap": float(cfg.adaptive_density_cap),
             "sequence_length": int(model.sequence_length),
         }
-        if ds_cls is Davis240Dataset:
-            ds_kwargs["side"] = "left"
+        # Note: Davis240Dataset would need 'side' parameter when implemented
+        # if ds_cls is Davis240Dataset:
+        #     ds_kwargs["side"] = "left"
         ds_tr = ds_cls(**ds_kwargs)
         n_r = len(ds_tr)
         n_train_r = max(int(float(cfg.train_split) * n_r) - int(safe_gap), 1)
@@ -148,8 +153,7 @@ def build_dataloaders(
             "adaptive_density_cap": float(cfg.adaptive_density_cap),
             "sequence_length": int(model.sequence_length),
         }
-        if ds_cls is Davis240Dataset:
-            ds_kwargs["side"] = "left"
+        # TODO: Davis240Dataset would need 'side' parameter when implemented
         ds_val = ds_cls(**ds_kwargs)
 
         n = len(ds_val)

@@ -16,7 +16,7 @@ model:
 training:
   epochs: 500
   batch_size: 512
-  lr: 0.001
+  lr: 0.00006  # 6e-5，和 FNO-FAST 原版一致
   eval_interval: 1
   eval_batch_size: 1
   tbptt_len: 75
@@ -27,7 +27,7 @@ training:
   prefetch_factor: 1
   mixed_precision: true
   scheduler: cosine
-  warmup_epochs: 10
+  warmup_epochs: 20  # 和 FNO-FAST 原版一致
   patience: 50
   earlystop_metric: ate
   optimizer: adamw

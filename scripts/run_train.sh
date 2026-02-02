@@ -236,6 +236,15 @@ if [[ "${WIN_TAG}" = "_imuWin" ]]; then
     WINDOWING_ARGS="${WINDOWING_ARGS} --window_dt ${WINDOW_DT}"
 fi
 
+# 基础 loss 权重（可通过环境变量覆盖）
+LOSS_W_T=${LOSS_W_T:-8.0}
+LOSS_W_R=${LOSS_W_R:-8.0}  # 增加旋转权重，防止 RPE_r 恶化
+LOSS_W_V=${LOSS_W_V:-0.1}
+
+# Early stopping 配置
+EARLYSTOP_MIN_EPOCH=${EARLYSTOP_MIN_EPOCH:-3}  # 降低最小 epoch，让早期好模型能保存
+EARLYSTOP_MA_WINDOW=${EARLYSTOP_MA_WINDOW:-1}  # 使用单 epoch ATE，不做移动平均
+
 BASE_ARGS="--batch_by_root \
     --dt ${DT} \
     --sample_stride ${SAMPLE_STRIDE} \
@@ -258,6 +267,11 @@ BASE_ARGS="--batch_by_root \
     --warmup_epochs 10 \
     --patience 50 \
     --earlystop_metric ate \
+    --earlystop_min_epoch ${EARLYSTOP_MIN_EPOCH} \
+    --earlystop_ma_window ${EARLYSTOP_MA_WINDOW} \
+    --loss_w_t ${LOSS_W_T} \
+    --loss_w_r ${LOSS_W_R} \
+    --loss_w_v ${LOSS_W_V} \
     --no-uncertainty_fusion \
     --no-uncertainty_gate \
     --loss_w_uncertainty 0 \
@@ -282,6 +296,8 @@ echo "  seq_stride:  ${SEQ_STRIDE}"
 echo "  输出目录:    ${OUT_DIR}"
 echo "  日志文件:    ${LOG_FILE}"
 echo "  切窗:        ${WIN_TAG} (${WINDOWING_ARGS})"
+echo "  Loss权重:    t=${LOSS_W_T}, r=${LOSS_W_R}, v=${LOSS_W_V}"
+echo "  早停最小epoch: ${EARLYSTOP_MIN_EPOCH}"
 echo "=========================================="
 echo ""
 read -p "确认启动训练? [y/N]: " CONFIRM
@@ -292,6 +308,9 @@ fi
 
 echo ""
 echo "启动训练..."
+
+# 设置评估输出目录（启用轨迹绘图）
+export FNO_EVIO_EVAL_OUTDIR="${OUT_DIR}/eval_plots"
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} nohup python -u "${CODE}/train_fno_vio.py" \
     --config "${CODE}/configs/base.yaml" \

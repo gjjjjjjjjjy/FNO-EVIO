@@ -21,7 +21,7 @@ try:
 except Exception:
     hdf5plugin = None
 
-from utils import (
+from fno_evio.legacy.utils import (
     QuaternionUtils,
     warp_events_flow_torch,
     warp_events_flow_torch_kb4,
@@ -3029,15 +3029,17 @@ class EventProcessor:
             xs_float = torch.clamp(x * float(W - 1), 0.0, float(W - 1))
             ys_float = torch.clamp(y * float(H - 1), 0.0, float(H - 1))
         else:
-            src_w_safe = float(max(int(src_w), 1))
-            src_h_safe = float(max(int(src_h), 1))
-            x_scaled = x * float(W) / src_w_safe
-            y_scaled = y * float(H) / src_h_safe
+            src_w_i = max(int(src_w), 1)
+            src_h_i = max(int(src_h), 1)
+            x_scaled = x * float(W - 1) / float(max(src_w_i - 1, 1))
+            y_scaled = y * float(H - 1) / float(max(src_h_i - 1, 1))
             xs_float = torch.clamp(x_scaled, 0.0, float(W - 1))
             ys_float = torch.clamp(y_scaled, 0.0, float(H - 1))
-        # Convert to long indices only at the final step
-        xs = xs_float.long()
-        ys = ys_float.long()
+
+        xs = torch.round(xs_float).long()
+        ys = torch.round(ys_float).long()
+        xs = torch.clamp(xs, 0, W - 1)
+        ys = torch.clamp(ys, 0, H - 1)
         idx = ys * W + xs
         dt = max(float(t_curr - t_prev), 1e-6)
         norm_t = torch.clamp((t - t_prev) / dt, 0.0, 1.0)
@@ -3160,7 +3162,7 @@ class AdaptiveEventProcessor:
             times_p = F.avg_pool2d(times, kernel_size=(kh, kw), stride=(kh, kw))
 
             # Direct interpolation without multiple fallbacks
-            counts_u = F.interpolate(counts_p.unsqueeze(0), size=(H, W), mode="nearest").squeeze(0)
+            counts_u = F.interpolate(counts_p.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False).squeeze(0)
             times_u = F.interpolate(times_p.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False).squeeze(0)
 
             return torch.cat([counts_u, times_u], dim=0)
