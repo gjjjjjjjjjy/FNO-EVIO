@@ -44,7 +44,13 @@ def _strip_prefixes(state: Dict[str, Any]) -> Dict[str, Any]:
 def _infer_model_config_from_state_dict(sd: Dict[str, torch.Tensor], *, dt: float) -> ModelConfig:
     k_channels = int(sd["stem.0.weight"].shape[1]) if "stem.0.weight" in sd else 5
     win_k = max(k_channels // 5, 1)
-    stem_channels = int(sd["stem.0.weight"].shape[0]) if "stem.0.weight" in sd else 64
+
+    if "stem.4.weight" in sd:
+        stem_channels = int(sd["stem.4.weight"].shape[0])
+    elif "stem.0.weight" in sd:
+        stem_channels = int(sd["stem.0.weight"].shape[0])
+    else:
+        stem_channels = 64
 
     modes = 10
     if "fno_block.unit.spec1.weight" in sd:
@@ -84,7 +90,8 @@ def _infer_model_config_from_state_dict(sd: Dict[str, torch.Tensor], *, dt: floa
     if "imu_encoder.fc.weight" in sd:
         imu_embed_dim = int(sd["imu_encoder.fc.weight"].shape[0])
     elif "scale_head.0.weight" in sd:
-        imu_embed_dim = int(sd["scale_head.0.weight"].shape[1])
+        in_features = int(sd["scale_head.0.weight"].shape[1])
+        imu_embed_dim = max(int(in_features - 4), 1)
 
     use_cudnn_lstm = any(("imu_encoder.lstm.weight_ih_l0" in k) for k in sd.keys())
     norm_mode = "gn"
@@ -140,6 +147,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--dt", type=float, default=0.00833)
     p.add_argument("--rpe_dt", type=float, default=None)
+    p.add_argument("--sample_stride", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--resolution", type=int, nargs=2, default=(180, 320))
@@ -203,11 +211,16 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     results = []
     for r in roots:
+        stride = max(int(args.sample_stride), 1)
+        print(
+            f"[EVAL CFG] root={str(Path(r).expanduser().resolve())} | dt={float(dt):.6f} | "
+            f"resolution=({int(args.resolution[0])},{int(args.resolution[1])}) | sample_stride={stride}"
+        )
         ds_cfg = DatasetConfig(
             root=str(Path(r).expanduser().resolve()),
             dt=float(dt),
             resolution=(int(args.resolution[0]), int(args.resolution[1])),
-            sample_stride=8,
+            sample_stride=stride,
             windowing_mode="imu",
             window_dt=float(dt),
             train_split=0.0,
@@ -216,7 +229,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         exp = ExperimentConfig(dataset=ds_cfg, model=model_cfg, training=train_cfg, seed=0, device=str(device.type))
         _ = exp
         _, val_loader = build_dataloaders(ds_cfg, training=train_cfg, model=model_cfg, device=device)
-        ate, rpe_t, rpe_r = evaluate(
+        ate, rpe_t, rpe_r, _ = evaluate(
             model=model,
             loader=val_loader,
             device=device,

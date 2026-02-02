@@ -265,7 +265,7 @@ BASE_ARGS="--batch_by_root \
     --mixed_precision \
     --scheduler cosine \
     --warmup_epochs 10 \
-    --patience 50 \
+    --patience 100 \
     --earlystop_metric ate \
     --earlystop_min_epoch ${EARLYSTOP_MIN_EPOCH} \
     --earlystop_ma_window ${EARLYSTOP_MA_WINDOW} \

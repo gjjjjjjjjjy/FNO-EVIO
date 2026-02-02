@@ -366,7 +366,7 @@ def train(
                     rpes_t: List[float] = []
                     rpes_r: List[float] = []
                     for ld in val_loader.values():
-                        ate_i, rpe_t_i, rpe_r_i = evaluate(
+                        ate_i, rpe_t_i, rpe_r_i, _ = evaluate(
                             model=model,
                             loader=ld,
                             device=device,
@@ -383,7 +383,7 @@ def train(
                         eval_rpe_t = float(sum(rpes_t) / float(len(rpes_t)))
                         eval_rpe_r = float(sum(rpes_r) / float(len(rpes_r)))
                 else:
-                    eval_ate, eval_rpe_t, eval_rpe_r = evaluate(
+                    eval_ate, eval_rpe_t, eval_rpe_r, _ = evaluate(
                         model=model,
                         loader=val_loader,
                         device=device,

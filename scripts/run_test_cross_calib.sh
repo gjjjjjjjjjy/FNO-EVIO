@@ -177,7 +177,7 @@ case ${TEST_MODE} in
         ;;
     *)
         RUN_PREFIX="B2A"
-        TEST_PY="${CODE}/test_fno_vio.py"
+        TEST_PY="${CODE}/apps/TUM-VIE/test_fno_vio.py"
         ;;
 esac
 echo ">>> 推理模式: ${RUN_PREFIX}"
