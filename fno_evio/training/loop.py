@@ -25,7 +25,7 @@ from fno_evio.common.constants import NumericalConstants
 from fno_evio.config.schema import TrainingConfig
 from fno_evio.training.loss_components import LossComposer
 from fno_evio.training.physics import PhysicsBrightnessLoss
-from fno_evio.training.step import IMUStateManager, StepResult, quat_to_rot, train_one_step, unpack_and_validate_batch, unpack_step_item
+from fno_evio.training.step import IMUStateManager, StepResult, quat_to_rot, train_one_step, unpack_and_validate_batch, unpack_step_item, validate_dt_consistency
 from fno_evio.utils.metrics import compute_rpe_loss
 
 
@@ -104,10 +104,23 @@ def _build_optimizer_and_scheduler(
 
 
 def _clip_gradients(model: nn.Module, max_norm: float) -> None:
-    try:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
-    except Exception:
-        pass
+    """Manual gradient clipping that handles complex numbers (FNO-FAST compatible)."""
+    total_norm = 0.0
+    parameters = list(filter(lambda p: p.grad is not None, model.parameters()))
+
+    for p in parameters:
+        if p.grad.is_complex():
+            # For complex parameters, use abs() before computing norm
+            param_norm = p.grad.detach().abs().norm(2)
+        else:
+            param_norm = p.grad.detach().norm(2)
+        total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** 0.5
+
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1:
+        for p in parameters:
+            p.grad.detach().mul_(clip_coef)
 
 
 def _detach_tree(v: Any) -> Any:
@@ -118,6 +131,90 @@ def _detach_tree(v: Any) -> Any:
     if isinstance(v, dict):
         return {k: _detach_tree(val) for k, val in v.items()}
     return v
+
+
+def _detach_hidden(hidden: Optional[Tuple[torch.Tensor, torch.Tensor]]) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Detach hidden state for TBPTT (FNO-FAST compatible)."""
+    if hidden is None:
+        return None
+    h, c = hidden
+    return (h.detach().contiguous(), c.detach().contiguous())
+
+
+def _adjust_hidden_size(hidden: Optional[Tuple[torch.Tensor, torch.Tensor]], B: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Adjust hidden state batch size (FNO-FAST compatible)."""
+    if hidden is None:
+        return None
+    h, c = hidden
+    # h, c: [L, B_curr, H]
+    B_curr = h.size(1)
+    if B_curr == B:
+        return (h.contiguous(), c.contiguous())
+    if B_curr > B:
+        return (h[:, :B, :].contiguous(), c[:, :B, :].contiguous())
+    # B_curr < B → pad zeros for new entries
+    pad = B - B_curr
+    dev = h.device
+    H = h.size(2)
+    zeros_h = torch.zeros(h.size(0), pad, H, device=dev, dtype=h.dtype)
+    zeros_c = torch.zeros(c.size(0), pad, H, device=dev, dtype=c.dtype)
+    return (
+        torch.cat([h, zeros_h], dim=1).contiguous(),
+        torch.cat([c, zeros_c], dim=1).contiguous(),
+    )
+
+
+def _get_ids(base_seq: Any, base_base: Any, starts_list: Optional[List[int]], s_idx: int, j: int, b: Optional[int] = None) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    Get segment IDs for segment-aware reset (FNO-FAST compatible).
+
+    Returns:
+        (contig_id, gt_id, segment_id) tuple
+    """
+    start_b = starts_list[b] if (starts_list is not None and b is not None) else (base_seq.starts[s_idx] if hasattr(base_seq, "starts") else 0)
+    idx = int(start_b) + int(j)
+    if idx < 0:
+        return None, None, None
+
+    try:
+        base_len = len(base_base)
+        if base_len <= 0:
+            return None, None, None
+        if idx >= base_len:
+            return None, None, None
+    except Exception:
+        pass
+
+    contig_id = idx
+    inner_idx = idx
+    if hasattr(base_base, "indices"):
+        try:
+            if idx >= len(base_base.indices):
+                return None, None, None
+            inner_idx = int(base_base.indices[idx])
+            contig_id = inner_idx
+        except Exception:
+            return None, None, None
+
+    ds = base_base.dataset if hasattr(base_base, "dataset") else base_base
+    gt_id = inner_idx
+    if hasattr(ds, "sample_indices"):
+        try:
+            if inner_idx < 0 or inner_idx >= len(ds.sample_indices):
+                return None, None, None
+            gt_id = int(ds.sample_indices[inner_idx])
+        except Exception:
+            return None, None, None
+
+    segment_id = None
+    if hasattr(ds, "segment_ids"):
+        try:
+            if inner_idx >= 0 and inner_idx < len(ds.segment_ids):
+                segment_id = int(ds.segment_ids[inner_idx])
+        except Exception:
+            segment_id = None
+
+    return contig_id, gt_id, segment_id
 
 
 def train(
@@ -203,36 +300,67 @@ def train(
     bad_epochs = 0
     metric_hist: List[float] = []
 
-    # IMU state manager for tracking velocity/rotation across temporal steps
     imu_state_mgr = IMUStateManager(device)
+
+    last_segment_id: Optional[int] = None
+    global_hidden: Any = None  # Cross-batch hidden state (FNO-FAST behavior)
+
+    # Get base dataset for segment_ids access
+    base_seq = train_loader.dataset
+    base_base = base_seq.dataset if hasattr(base_seq, "dataset") else base_seq
 
     for epoch in range(int(cfg.epochs)):
         total = 0.0
         count = 0
-        hidden: Any = None
+        # Reset segment tracking at epoch start (like FNO-FAST)
+        last_segment_id = None
+        global_hidden = None
+
         prev_pred_full: Optional[torch.Tensor] = None
         prev_gt_full: Optional[torch.Tensor] = None
-        prev_dp_pred: Optional[torch.Tensor] = None
-        prev_dp_gt: Optional[torch.Tensor] = None
+        prev_dp_pred: Optional[torch.Tensor] = None  # For smoothness loss (FNO-FAST: prev_t_pred)
         for batch_idx, batch in enumerate(train_loader):
-            batch_data, _ = unpack_and_validate_batch(batch)
+            batch_data, starts_list = unpack_and_validate_batch(batch)
             if not isinstance(batch_data, list):
                 continue
 
-            # Reset IMU state at the beginning of each batch/sequence
-            imu_state_mgr.reset()
-            hidden = None
+            contig0, sid0, seg0 = _get_ids(base_seq, base_base, starts_list, batch_idx, 0, 0)
+
+            # Check segment continuity
+            contiguous = True
+            if seg0 is not None and last_segment_id is not None:
+                contiguous = (int(seg0) == int(last_segment_id))
+
+            # Reset hidden state at segment boundaries (FNO-FAST behavior)
+            if not contiguous:
+                global_hidden = None
+                print(f"[TRAIN RESET] batch_idx={batch_idx} seg_id={seg0} (segment boundary detected)")
+
+            # Use global_hidden from previous batch (or None if reset)
+            hidden = global_hidden
+
+            # Reset IMU state at segment boundary or first batch
+            if not contiguous or batch_idx == 0:
+                imu_state_mgr.reset()
 
             # Initialize IMU rotation from first GT absolute quaternion if available
             # GT format: [0:3] delta_p, [3:7] delta_q, [7:11] q_prev, [11:14] v_prev, [14:17] v_curr
+            # This matches FNO-FAST's behavior (train_fno_vio.py:4931-4941)
             if len(batch_data) > 0:
                 try:
-                    ev0, imu0, y0, _ = unpack_step_item(batch_data[0])
+                    ev0, imu0, y0, _, _ = unpack_step_item(batch_data[0])
                     y0_dev = y0.to(device, non_blocking=True)
                     if y0_dev.ndim == 1:
                         y0_dev = y0_dev.unsqueeze(0)
+
+                    # Adjust hidden size for batch size changes
+                    B = ev0.size(0) if hasattr(ev0, 'size') else y0_dev.size(0)
+                    hidden = _adjust_hidden_size(hidden, B) if hidden is not None else None
+
+                    # Initialize IMU state at step_idx == 0 (FNO-FAST behavior)
+                    imu_state_mgr.initialize(B)
+
                     # Use absolute quaternion at y[:, 7:11] for IMU rotation initialization
-                    # This matches FNO-FAST's behavior (train_fno_vio.py:4703)
                     if y0_dev.shape[-1] >= 11:
                         q0 = y0_dev[:, 7:11]  # absolute quaternion [x, y, z, w]
                         q0 = torch.nn.functional.normalize(q0, p=2, dim=1)
@@ -251,7 +379,34 @@ def train(
                 local_steps = 0
                 seg_end = min(step_idx + tbptt_len, len(batch_data))
                 for j in range(step_idx, seg_end):
-                    ev, imu, y, dt_tensor = unpack_step_item(batch_data[j])
+                    ev, imu, y, dt_tensor, intr_tensor = unpack_step_item(batch_data[j])
+
+                    # Move tensors to device
+                    ev = ev.to(device, non_blocking=True)
+                    imu = imu.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+
+                    # Validate and process dt_tensor (FNO-FAST compatible)
+                    actual_dt = float(dt_window_fallback)
+                    if dt_tensor is not None:
+                        dt_tensor = dt_tensor.to(device, non_blocking=True)
+                        actual_dt = validate_dt_consistency(dt_tensor, batch_idx)
+
+                    # Process intrinsics tensor (FNO-FAST compatible)
+                    fx_step, fy_step = float(physics_config.get('fx', 1.0)), float(physics_config.get('fy', 1.0))
+                    if intr_tensor is not None:
+                        intr_tensor = intr_tensor.to(device, non_blocking=True)
+                        if intr_tensor.numel() >= 2:
+                            intr_flat = intr_tensor.view(intr_tensor.shape[0], -1)
+                            if intr_flat.shape[1] >= 2:
+                                fx_step = float(intr_flat[:, 0].mean().item())
+                                fy_step = float(intr_flat[:, 1].mean().item())
+
+                    # Update physics config with per-step intrinsics
+                    step_physics_config = dict(physics_config)
+                    step_physics_config['fx'] = fx_step
+                    step_physics_config['fy'] = fy_step
+
                     is_amp = bool(cfg.mixed_precision) and scaler is not None
                     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=is_amp):
                         res: StepResult = train_one_step(
@@ -265,25 +420,29 @@ def train(
                             config=cfg,
                             loss_composer=loss_composer,
                             physics_module=physics_module,
-                            physics_config=physics_config,
+                            physics_config=step_physics_config,
                             current_epoch_physics_weight=float(cfg.loss_w_physics),
                             adaptive_loss_fn=adaptive_loss_fn,
                             batch_idx=int(batch_idx),
                             step_idx=int(j),
-                            dt_window_fallback=float(dt_window_fallback),
+                            dt_window_fallback=actual_dt,
                             is_amp=is_amp,
                             dt_tensor=dt_tensor,
                         )
                     hidden = res.hidden
+                    loss_j = res.loss
+
+                    # Progressive warmup (FNO-FAST compatible) - apply warmup multiplier instead of skipping
                     warmup_frames = int(getattr(cfg, "warmup_frames", 0))
                     if warmup_frames > 0 and j < warmup_frames:
+                        warmup_factor = min(1.0, (j + 1) / warmup_frames)
+                        loss_j = loss_j * warmup_factor
+                        if j == 0 and batch_idx % 50 == 0:
+                            print(f"[PROGRESSIVE_WARMUP] Step {j}/{warmup_frames}, factor: {warmup_factor:.2f}")
+                        # Reset prev buffers during warmup (but still accumulate loss)
                         prev_pred_full = None
                         prev_gt_full = None
                         prev_dp_pred = None
-                        prev_dp_gt = None
-                        continue
-
-                    loss_j = res.loss
 
                     if bool(getattr(cfg, "use_rpe_loss", False)) and float(getattr(cfg, "loss_w_rpe", 0.0)) > 0.0:
                         try:
@@ -297,18 +456,17 @@ def train(
                             prev_pred_full = None
                             prev_gt_full = None
 
+                    # Smoothness loss (FNO-FAST compatible: mse_loss on displacement prediction differences)
                     if float(getattr(cfg, "loss_w_smooth", 0.0)) > 0.0:
                         try:
                             dp_pred = res.pred[:, 0:3]
-                            dp_gt = y.to(device=device, dtype=dp_pred.dtype)[:, 0:3]
-                            if prev_dp_pred is not None and prev_dp_gt is not None:
-                                smooth = torch.nn.functional.smooth_l1_loss(dp_pred - prev_dp_pred, dp_gt - prev_dp_gt, beta=0.1)
+                            if prev_dp_pred is not None:
+                                # FNO-FAST uses mse_loss between current and previous prediction
+                                smooth = torch.nn.functional.mse_loss(dp_pred, prev_dp_pred)
                                 loss_j = loss_j + float(getattr(cfg, "loss_w_smooth", 0.0)) * smooth
                             prev_dp_pred = dp_pred.detach()
-                            prev_dp_gt = dp_gt.detach()
                         except Exception:
                             prev_dp_pred = None
-                            prev_dp_gt = None
 
                     if bool(getattr(cfg, "use_imu_consistency", False)) and float(getattr(cfg, "loss_w_imu", 0.0)) > 0.0:
                         try:
@@ -346,6 +504,10 @@ def train(
                 imu_state_mgr.detach_states()
 
                 step_idx += tbptt_stride
+
+            # ========== FNO-FAST compatible: preserve hidden state for next batch ==========
+            global_hidden = hidden
+            last_segment_id = seg0
 
         mean_loss = total / max(count, 1)
         print(f"[TRAIN] epoch={epoch} mean_loss={mean_loss:.6f}")

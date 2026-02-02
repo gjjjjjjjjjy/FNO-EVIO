@@ -86,8 +86,13 @@ def _infer_model_config_from_state_dict(sd: Dict[str, torch.Tensor], *, dt: floa
     fusion_dim = int(sd["v_proj.weight"].shape[0]) if use_cross and "v_proj.weight" in sd else None
     fusion_heads = 4
 
+    # Infer imu_embed_dim from checkpoint
+    # Priority: imu_encoder.encoder.3.weight (most reliable) > imu_encoder.fc.weight > scale_head fallback
     imu_embed_dim = 64
-    if "imu_encoder.fc.weight" in sd:
+    if "imu_encoder.encoder.3.weight" in sd:
+        # ImprovedIMUEncoder: encoder.3 is the final Linear layer, output dim = imu_embed_dim
+        imu_embed_dim = int(sd["imu_encoder.encoder.3.weight"].shape[0])
+    elif "imu_encoder.fc.weight" in sd:
         imu_embed_dim = int(sd["imu_encoder.fc.weight"].shape[0])
     elif "scale_head.0.weight" in sd:
         in_features = int(sd["scale_head.0.weight"].shape[1])

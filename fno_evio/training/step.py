@@ -115,9 +115,17 @@ def unpack_and_validate_batch(batch: Any) -> Tuple[Any, List]:
     return batch_data, starts_list
 
 
-def unpack_step_item(item: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+def unpack_step_item(item: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
-    Unpack one temporal step item.
+    Unpack one temporal step item (FNO-FAST compatible).
+
+    Returns:
+        (ev, imu, y, dt_tensor, intr_tensor) tuple
+        - ev: event voxel tensor
+        - imu: IMU tensor
+        - y: ground truth tensor
+        - dt_tensor: optional dt per sample
+        - intr_tensor: optional intrinsics per sample
     """
     if isinstance(item, (list, tuple)) and len(item) == 1 and isinstance(item[0], (list, tuple)):
         item = item[0]
@@ -126,8 +134,45 @@ def unpack_step_item(item: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tenso
     ev = item[0]
     imu = item[1]
     y = item[2]
-    dt_tensor = item[3] if len(item) > 3 else None
-    return ev, imu, y, dt_tensor
+    # FNO-FAST compatible: handle 3, 4, or 5 element items
+    if len(item) == 3:
+        dt_tensor = None
+        intr_tensor = None
+    elif len(item) == 4:
+        dt_tensor = item[3]
+        intr_tensor = None
+    else:
+        dt_tensor = item[3]
+        intr_tensor = item[4]
+    return ev, imu, y, dt_tensor, intr_tensor
+
+
+def validate_dt_consistency(dt_tensor: torch.Tensor, batch_idx: int) -> float:
+    """
+    Validate that all samples in batch share consistent dt_window (FNO-FAST compatible).
+
+    Args:
+        dt_tensor: dt tensor for the batch
+        batch_idx: current batch index for error messages
+
+    Returns:
+        mean dt value
+
+    Raises:
+        ValueError: if dt values are inconsistent across batch
+    """
+    dt_flat = dt_tensor.view(dt_tensor.shape[0], -1) if dt_tensor.ndim > 1 else dt_tensor.view(-1, 1)
+    dt_per_sample = dt_flat.mean(dim=1)
+    dt_min = float(dt_per_sample.min().item())
+    dt_max = float(dt_per_sample.max().item())
+    dt_mean = max(float(dt_per_sample.mean().item()), 1e-6)
+    if abs(dt_max - dt_min) / dt_mean > 1e-3:
+        raise ValueError(
+            f"[DT CHECK] Inconsistent dt_window in batch {batch_idx}: "
+            f"range=({dt_min:.6e}, {dt_max:.6e}), mean={dt_mean:.6e}. "
+            f"Please ensure all samples in a batch share the same dt_window."
+        )
+    return dt_mean
 
 
 def train_one_step(
